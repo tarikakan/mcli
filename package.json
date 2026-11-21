@@ -1,0 +1,29 @@
+{
+  "name": "mcli",
+  "version": "0.1.0",
+  "description": "Unified CLI & Chat TUI combining Claude, Codex, Agy, DeepSeek, and Kimi with shared conversation history",
+  "type": "module",
+  "bin": {
+    "mcli": "./bin/mcli.mjs"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "start": "node ./bin/mcli.mjs",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "cli",
+    "tui",
+    "ai",
+    "claude",
+    "codex",
+    "agy",
+    "deepseek",
+    "kimi",
+    "agents"
+  ],
+  "license": "MIT"
+}
