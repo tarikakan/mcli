@@ -1,5 +1,7 @@
 import { getAdapter } from "./adapters/index.ts";
 import { buildPromptWithContext, createMessageId } from "./session.ts";
+import { buildSkillsPromptBlock, prependSkillsToPrompt } from "./skills.ts";
+import type { SkillInfo } from "./skills.ts";
 import { formatTargetLabel } from "./types.ts";
 import type {
   AgentId,
@@ -25,6 +27,7 @@ export interface RunDiscussionOptions {
   sessionSummary?: string;
   summarizedUpTo?: number;
   transcriptPath?: string;
+  skills?: SkillInfo[];
   cwd: string;
   config: McliConfig;
   rounds: number;
@@ -151,6 +154,8 @@ export async function runAgentDiscussion(
   let hadError = false;
 
   const participantLabels = opts.targets.map((t) => formatTargetLabel(t));
+  const activeSkills = opts.skills ?? [];
+  const skillsPromptBlock = buildSkillsPromptBlock(activeSkills);
 
   const runParticipant = async (
     target: AgentTarget,
@@ -165,12 +170,13 @@ export async function runAgentDiscussion(
     opts.onParticipantStart?.({ index, target, roundLabel });
 
     const res = await adapter.run({
-      prompt,
+      prompt: prependSkillsToPrompt(prompt, activeSkills),
       rawUserPrompt,
       history: opts.history,
       sessionSummary: opts.sessionSummary,
       summarizedUpTo: opts.summarizedUpTo,
       transcriptPath: opts.transcriptPath,
+      skillsPromptBlock,
       cwd: opts.cwd,
       model: target.model,
       config: agentConfig,

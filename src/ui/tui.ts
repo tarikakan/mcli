@@ -20,7 +20,6 @@ import type { ModelOption } from "../models.ts";
 import {
   buildPromptWithContext,
   buildSharedContextBlock,
-  compactSession,
   createMessageId,
   exportSessionMarkdown,
   getSessionTranscriptPath,
@@ -29,6 +28,13 @@ import {
   saveSession,
   saveSessionAs,
 } from "../session.ts";
+import {
+  buildSkillsPromptBlock,
+  discoverSkills,
+  prependSkillsToPrompt,
+  resolveRequestedSkills,
+} from "../skills.ts";
+import type { SkillInfo } from "../skills.ts";
 import { AGENT_IDS, AGENT_META, formatTargetLabel } from "../types.ts";
 import type {
   AgentAvailability,
@@ -65,6 +71,8 @@ const SLASH_COMMANDS = [
   "/help",
   "/status",
   "/agents",
+  "/skills",
+  "/skill",
   "/clear",
   "/compact",
   "/memory",
@@ -178,6 +186,7 @@ export class UnifiedChatTui {
   private lastCtrlCAt = 0;
   private mouseEnabled = true;
   private memoryCompacting = false;
+  private availableSkills: SkillInfo[] = [];
   private modelPicker: ModelPickerState | null = null;
   private renderScheduled = false;
   private running = false;
@@ -192,6 +201,7 @@ export class UnifiedChatTui {
     this.agentDiscussion = opts.agentDiscussion ?? opts.config.agentDiscussion;
     this.discussionRounds = opts.discussionRounds ?? opts.config.discussionRounds;
     this.availability = detectAllAgents(opts.config);
+    this.availableSkills = discoverSkills(opts.cwd, opts.config);
     if (opts.agentModels) {
       this.modelOverrides = { ...opts.agentModels };
     }
@@ -339,6 +349,18 @@ export class UnifiedChatTui {
       return SLASH_COMMANDS.find((c) => c.startsWith(beforeCursor) && c !== beforeCursor);
     }
 
+    const dollarMatch = beforeCursor.match(/(?:^|\s)(\$[a-zA-Z0-9._-]*)$/);
+    if (dollarMatch) {
+      const prefix = dollarMatch[1];
+      const partial = prefix.slice(1).toLowerCase();
+      const matched = this.availableSkills.find(
+        (s) => s.name.toLowerCase().startsWith(partial) && s.name.toLowerCase() !== partial,
+      );
+      if (matched) {
+        return beforeCursor.slice(0, beforeCursor.length - prefix.length) + "$" + matched.name + " ";
+      }
+    }
+
     const tokenMatch = beforeCursor.match(/(?:^|\s)((?:--|@)[a-zA-Z]*)$/);
     if (tokenMatch) {
       const prefix = tokenMatch[1];
@@ -346,7 +368,7 @@ export class UnifiedChatTui {
       const partial = prefix.slice(lead.length).toLowerCase();
       const candidates =
         lead === "--"
-          ? [...AGENT_IDS, "models", "model", "discuss", "agent-discussion", "rounds"]
+          ? [...AGENT_IDS, "models", "model", "skills", "skill", "discuss", "agent-discussion", "rounds"]
           : [...AGENT_IDS];
       const matched = candidates.find((id) => id.startsWith(partial) && id !== partial);
       if (matched) {
@@ -880,6 +902,11 @@ export class UnifiedChatTui {
       return;
     }
 
+    if (parsed.listSkills) {
+      this.showSkillsInChat();
+      return;
+    }
+
     if (parsed.switchOnly) {
       if (parsed.agents.length > 0) {
         const target = parsed.agents[0];
@@ -952,6 +979,7 @@ export class UnifiedChatTui {
       discuss: useDiscuss && targets.length >= 2,
       rounds,
       synthesize: !parsed.noSynthesis,
+      skills: parsed.skills,
     });
   }
 
@@ -984,6 +1012,8 @@ export class UnifiedChatTui {
             "- `Ctrl+C` / `Esc`: cancel active streaming response without quitting",
             "",
             "**Slash Commands:**",
+            "- `/skills` or `--skills` — list all skills from Claude, Codex, Agy, Kimi & workspace",
+            "- `/skill [use <name>|off <name>|clear|show <name>]` — pin/unpin or inspect skills across all agents (or use `--skill <name>` / `$<name>` per turn)",
             "- `/discuss [on|off|rounds <N>]` — toggle default multi-agent discussion mode",
             "- `/model` or `--models` — open model picker or list models across all 5 CLIs",
             "- `/model <name>` — set model for active agent (or `/model <agent> <name>`, `/model default`, `/model save`)",
@@ -1001,6 +1031,74 @@ export class UnifiedChatTui {
           ].join("\n"),
         );
         return;
+
+      case "skills":
+        this.showSkillsInChat();
+        return;
+
+      case "skill": {
+        const parts = args.split(/\s+/).filter(Boolean);
+        const sub = (parts[0] || "list").toLowerCase();
+        this.availableSkills = discoverSkills(this.cwd, this.config);
+
+        if (sub === "list") {
+          this.showSkillsInChat();
+          return;
+        }
+        if (sub === "clear") {
+          this.session.pinnedSkills = [];
+          saveSession(this.session);
+          this.setNotice("Cleared all pinned session skills.");
+          return;
+        }
+        if ((sub === "use" || sub === "add" || sub === "pin") && parts[1]) {
+          const { resolved, missing } = resolveRequestedSkills(parts.slice(1), this.availableSkills);
+          const current = new Set(this.session.pinnedSkills ?? []);
+          for (const s of resolved) current.add(s.name);
+          this.session.pinnedSkills = Array.from(current);
+          saveSession(this.session);
+          if (resolved.length > 0 && missing.length === 0) {
+            this.setNotice(`Pinned skill(s) for this session: ${resolved.map((s) => s.name).join(", ")}`);
+          } else if (resolved.length > 0) {
+            this.setNotice(`Pinned: ${resolved.map((s) => s.name).join(", ")} (not found: ${missing.join(", ")})`);
+          } else {
+            this.setNotice(`Skill(s) not found: ${missing.join(", ")}. Type /skills to list.`);
+          }
+          return;
+        }
+        if ((sub === "off" || sub === "remove" || sub === "unpin") && parts[1]) {
+          const drop = new Set(parts.slice(1).map((p) => p.toLowerCase()));
+          this.session.pinnedSkills = (this.session.pinnedSkills ?? []).filter(
+            (n) => !drop.has(n.toLowerCase()),
+          );
+          saveSession(this.session);
+          this.setNotice(
+            `Pinned skills: ${(this.session.pinnedSkills ?? []).join(", ") || "none"}`,
+          );
+          return;
+        }
+        if (sub === "show" && parts[1]) {
+          const { resolved } = resolveRequestedSkills([parts[1]], this.availableSkills);
+          if (resolved[0]) {
+            const s = resolved[0];
+            this.addSystemMessage(
+              [
+                `**Skill: \`${s.name}\`** *([${s.source}] — \`${s.filePath}\`)*`,
+                s.description ? `\n> ${s.description}` : "",
+                "",
+                s.body.slice(0, 4000) + (s.body.length > 4000 ? "\n\n*…[truncated]*" : ""),
+              ]
+                .filter(Boolean)
+                .join("\n"),
+            );
+          } else {
+            this.setNotice(`Skill "${parts[1]}" not found. Type /skills to list.`);
+          }
+          return;
+        }
+        this.setNotice("Usage: /skill [list | use <name> | off <name> | clear | show <name>]");
+        return;
+      }
 
       case "status":
       case "agents": {
@@ -1372,26 +1470,79 @@ export class UnifiedChatTui {
     }
   }
 
+  private showSkillsInChat(): void {
+    this.availableSkills = discoverSkills(this.cwd, this.config);
+    const pinnedSet = new Set((this.session.pinnedSkills ?? []).map((s) => s.toLowerCase()));
+    if (this.availableSkills.length === 0) {
+      this.addSystemMessage(
+        [
+          "**No `SKILL.md` skills found.**",
+          "",
+          "Checked: `~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`, `~/.gemini/antigravity-cli/skills`, `~/.kimi/skills`, `~/.mcli/skills`, and workspace `.claude/.codex/.agents/skills`.",
+          "You can also add custom paths via `skillDirs` in `~/.mcli/config.json`.",
+        ].join("\n"),
+      );
+      return;
+    }
+
+    const lines: string[] = [
+      `**Unified Skills (${this.availableSkills.length} found across Claude, Codex, Agy, Kimi & Workspace):**`,
+      "",
+    ];
+    for (const s of this.availableSkills) {
+      const pinned = pinnedSet.has(s.name.toLowerCase()) ? " **[pinned]**" : "";
+      const desc = s.description
+        ? ` — ${s.description.slice(0, 96)}${s.description.length > 96 ? "…" : ""}`
+        : "";
+      lines.push(`- \`${s.name}\` **[${s.source}]**${pinned}${desc}`);
+    }
+    lines.push(
+      "",
+      "Use any skill on any agent with `--skill <name>` or `$<name>`, or pin for the session with `/skill use <name>`.",
+    );
+    this.addSystemMessage(lines.join("\n"));
+  }
+
   private async dispatchTargets(
     targets: AgentTarget[],
     userPrompt: string,
-    discussionOpts: { discuss: boolean; rounds: number; synthesize: boolean },
+    discussionOpts: { discuss: boolean; rounds: number; synthesize: boolean; skills?: string[] },
   ): Promise<void> {
     const historySnapshot = [...this.session.messages];
     const transcriptPath = getSessionTranscriptPath(this.session.id);
+
+    // Resolve pinned + per-turn skills across all CLI skill directories
+    const requestedSkillNames = Array.from(
+      new Set([...(this.session.pinnedSkills ?? []), ...(discussionOpts.skills ?? [])]),
+    );
+    if (requestedSkillNames.length > 0) {
+      this.availableSkills = discoverSkills(this.cwd, this.config);
+    }
+    const { resolved: activeSkills, missing: missingSkills } = resolveRequestedSkills(
+      requestedSkillNames,
+      this.availableSkills,
+    );
+    const skillsPromptBlock = buildSkillsPromptBlock(activeSkills);
+    if (missingSkills.length > 0) {
+      this.setNotice(`Skill(s) not found: ${missingSkills.join(", ")} (run /skills to list).`, 4000);
+    }
 
     const targetListLabel =
       targets.length > 1
         ? targets.map((t) => formatTargetLabel(t)).join(discussionOpts.discuss ? " ↔ " : " + ")
         : undefined;
+    const skillTag =
+      activeSkills.length > 0 ? ` · skills: ${activeSkills.map((s) => s.name).join(", ")}` : "";
 
     const userMsg: ChatMessage = {
       id: createMessageId(),
       role: "user",
       agent: targets[0]?.agent,
       roundLabel: targetListLabel
-        ? `${targetListLabel}${discussionOpts.discuss ? ` · Discussion (${discussionOpts.rounds}r)` : ""}`
-        : undefined,
+        ? `${targetListLabel}${discussionOpts.discuss ? ` · Discussion (${discussionOpts.rounds}r)` : ""}${skillTag}`
+        : skillTag
+          ? `${formatTargetLabel(targets[0])}${skillTag}`
+          : undefined,
       content: userPrompt,
       timestamp: new Date().toISOString(),
     };
@@ -1434,6 +1585,7 @@ export class UnifiedChatTui {
           sessionSummary: this.session.summary,
           summarizedUpTo: this.session.summarizedUpTo,
           transcriptPath,
+          skills: activeSkills,
           cwd: this.cwd,
           config: effectiveConfig,
           rounds: discussionOpts.rounds,
@@ -1514,15 +1666,18 @@ export class UnifiedChatTui {
             const adapter = getAdapter(target.agent);
             const agentConfig = this.config.agents[target.agent] ?? {};
 
-            const fullPrompt = buildPromptWithContext({
-              userPrompt,
-              history: historySnapshot,
-              targetAgent: target.agent,
-              config: effectiveConfig,
-              sessionSummary: this.session.summary,
-              summarizedUpTo: this.session.summarizedUpTo,
-              transcriptPath,
-            });
+            const fullPrompt = prependSkillsToPrompt(
+              buildPromptWithContext({
+                userPrompt,
+                history: historySnapshot,
+                targetAgent: target.agent,
+                config: effectiveConfig,
+                sessionSummary: this.session.summary,
+                summarizedUpTo: this.session.summarizedUpTo,
+                transcriptPath,
+              }),
+              activeSkills,
+            );
 
             const res = await adapter.run({
               prompt: fullPrompt,
@@ -1531,6 +1686,7 @@ export class UnifiedChatTui {
               sessionSummary: this.session.summary,
               summarizedUpTo: this.session.summarizedUpTo,
               transcriptPath,
+              skillsPromptBlock,
               cwd: this.cwd,
               model: target.model,
               sessionId: this.session.agentSessions[target.agent],
@@ -1641,10 +1797,12 @@ export class UnifiedChatTui {
     const activeModel = this.modelOverrides[this.activeAgent] ?? this.config.agents[this.activeAgent]?.model;
     const modelPart = activeModel ? `  •  model: ${activeModel}` : "  •  model: default";
     const discPart = this.agentDiscussion ? `  •  discuss: on (${this.discussionRounds}r)` : "";
+    const pinnedSkills = this.session.pinnedSkills ?? [];
+    const skillPart = pinnedSkills.length > 0 ? `  •  skills: ${pinnedSkills.join(",")}` : "";
     const ctxPart = `context: ${this.shareContext ? "on" : "off"} (${msgCount} msgs)`;
     const row2 = truncateVisible(
       style(
-        ` dir: ${dirName}  •  session: ${this.session.name}  •  ${ctxPart}${modelPart}${discPart}  •  Ctrl+O: models  •  /help`,
+        ` dir: ${dirName}  •  session: ${this.session.name}  •  ${ctxPart}${modelPart}${discPart}${skillPart}  •  Ctrl+O: models  •  /help`,
         DIM,
       ),
       cols,
@@ -1876,8 +2034,13 @@ export class UnifiedChatTui {
     }
 
     let out = raw.replace(
-      /(^|\s)(--agent\s+discussion|--agent-discussion|--discuss(?:ion)?|--no-discuss(?:ion)?|--debate|--models|--no-synthesis|--rounds(?:=\d+|\s+\d+)?)(?=\s|$)/gi,
+      /(^|\s)(--agent\s+discussion|--agent-discussion|--discuss(?:ion)?|--no-discuss(?:ion)?|--debate|--models|--skills|--skill(?:=\S+|\s+\S+)?|--no-synthesis|--rounds(?:=\d+|\s+\d+)?)(?=\s|$)/gi,
       (_m, lead: string, flag: string) => `${lead}${style(flag, FG.brightCyan, BOLD)}`,
+    );
+
+    out = out.replace(
+      /(^|\s)(\$[a-zA-Z0-9][a-zA-Z0-9._-]*)(?=\s|$)/g,
+      (_m, lead: string, tok: string) => `${lead}${style(tok, FG.brightGreen, BOLD)}`,
     );
 
     out = out.replace(

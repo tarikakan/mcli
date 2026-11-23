@@ -6,6 +6,7 @@ export interface ParsedCliArgs {
   agents: AgentId[];
   agentModels: Partial<Record<AgentId, string>>;
   targets: AgentTarget[];
+  skills: string[];
   promptParts: string[];
   prompt: string;
   model?: string;
@@ -18,6 +19,7 @@ export interface ParsedCliArgs {
   plain: boolean;
   status: boolean;
   listModels: boolean;
+  listSkills: boolean;
   initConfig: boolean;
   help: boolean;
   version: boolean;
@@ -29,11 +31,13 @@ export interface ParsedInlineInput {
   agents: AgentId[];
   agentModels: Partial<Record<AgentId, string>>;
   targets: AgentTarget[];
+  skills: string[];
   modelOverride?: string;
   discuss?: boolean;
   discussionRounds?: number;
   noSynthesis: boolean;
   listModels: boolean;
+  listSkills: boolean;
   prompt: string;
   switchOnly: boolean;
   isSlashCommand: boolean;
@@ -53,6 +57,8 @@ const RESERVED_FLAGS = new Set<string>([
   "--models",
   "--model",
   "-m",
+  "--skills",
+  "--skill",
   "--session",
   "-s",
   "--new",
@@ -189,8 +195,25 @@ function parseShorthandModelFlag(token: string, agent: AgentId): string | undefi
   return resolveModelAlias(agent, cleaned);
 }
 
+function addSkillNames(target: string[], raw: string): void {
+  for (const part of raw.split(",")) {
+    const name = part.trim().replace(/^[$]+/, "");
+    if (name && !target.includes(name)) {
+      target.push(name);
+    }
+  }
+}
+
+function parseDollarSkillToken(token: string): string | undefined {
+  if (!token.startsWith("$") || token.length < 2) return undefined;
+  const cleaned = token.slice(1).replace(/[,;]+$/, "");
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(cleaned)) return undefined;
+  return cleaned;
+}
+
 export function parseCliArgs(argv: string[]): ParsedCliArgs {
   const rawTargets: AgentTarget[] = [];
+  const skills: string[] = [];
   const promptParts: string[] = [];
   const passthroughArgs: string[] = [];
   const unknownFlags: string[] = [];
@@ -205,6 +228,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   let plain = false;
   let status = false;
   let listModels = false;
+  let listSkills = false;
   let initConfig = false;
   let help = false;
   let version = false;
@@ -285,6 +309,31 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     }
     if (arg === "--models") {
       listModels = true;
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (arg === "--skills") {
+      listSkills = true;
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (arg === "--skill") {
+      const next = argv[i + 1];
+      if (next !== undefined) {
+        addSkillNames(skills, next);
+        i++;
+      }
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (arg.startsWith("--skill=")) {
+      addSkillNames(skills, arg.slice("--skill=".length));
+      pendingModelTarget = undefined;
+      continue;
+    }
+    const dollarSkill = parseDollarSkillToken(arg);
+    if (dollarSkill) {
+      addSkillNames(skills, dollarSkill);
       pendingModelTarget = undefined;
       continue;
     }
@@ -376,6 +425,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     agents,
     agentModels,
     targets,
+    skills,
     promptParts,
     prompt: promptParts.join(" ").trim(),
     model,
@@ -388,6 +438,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     plain,
     status,
     listModels,
+    listSkills,
     initConfig,
     help,
     version,
@@ -444,8 +495,10 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
       agents: [],
       agentModels: {},
       targets: [],
+      skills: [],
       noSynthesis: false,
       listModels: false,
+      listSkills: false,
       prompt: "",
       switchOnly: false,
       isSlashCommand: false,
@@ -460,8 +513,10 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
       agents: [],
       agentModels: {},
       targets: [],
+      skills: [],
       noSynthesis: false,
       listModels: false,
+      listSkills: false,
       prompt: "",
       switchOnly: false,
       isSlashCommand: true,
@@ -472,12 +527,14 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
 
   const tokens = tokenizeInline(trimmed);
   const rawTargets: AgentTarget[] = [];
+  const skills: string[] = [];
   const promptTokens: string[] = [];
   let modelOverride: string | undefined;
   let discuss: boolean | undefined;
   let discussionRounds: number | undefined;
   let noSynthesis = false;
   let listModels = false;
+  let listSkills = false;
   let pendingModelTarget: AgentTarget | undefined;
 
   for (let i = 0; i < tokens.length; i++) {
@@ -496,7 +553,34 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
       continue;
     }
 
+    if (text === "--skills") {
+      listSkills = true;
+      pendingModelTarget = undefined;
+      continue;
+    }
+
     const nextText = tokens[i + 1] && !tokens[i + 1].quoted ? tokens[i + 1].text : undefined;
+
+    if (text === "--skill") {
+      if (nextText) {
+        addSkillNames(skills, nextText);
+        i++;
+      }
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (text.startsWith("--skill=")) {
+      addSkillNames(skills, text.slice("--skill=".length));
+      pendingModelTarget = undefined;
+      continue;
+    }
+    const dollarSkill = parseDollarSkillToken(text);
+    if (dollarSkill) {
+      addSkillNames(skills, dollarSkill);
+      pendingModelTarget = undefined;
+      continue;
+    }
+
     const disc = isDiscussionFlag(text, nextText);
     if (disc.matched) {
       discuss = disc.value;
@@ -584,13 +668,15 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
     agents,
     agentModels,
     targets,
+    skills,
     modelOverride,
     discuss,
     discussionRounds,
     noSynthesis,
     listModels,
+    listSkills,
     prompt,
-    switchOnly: !listModels && (targets.length > 0 || Boolean(modelOverride)) && prompt.length === 0,
+    switchOnly: !listModels && !listSkills && (targets.length > 0 || Boolean(modelOverride)) && prompt.length === 0,
     isSlashCommand: false,
   };
 }

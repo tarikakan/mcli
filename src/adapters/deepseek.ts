@@ -27,10 +27,14 @@ function buildApiMessages(
   cwd: string,
   sessionSummary?: string,
   summarizedUpTo?: number,
+  skillsPromptBlock?: string,
 ): Array<{ role: "system" | "user" | "assistant"; content: string }> {
   const systemParts = [
     `You are DeepSeek participating in a unified multi-agent terminal chat (mcli). Current working directory: ${cwd}. Be concise, accurate, and directly continue from any prior turns in the shared conversation.`,
   ];
+  if (skillsPromptBlock && skillsPromptBlock.trim()) {
+    systemParts.push(`\n${skillsPromptBlock.trim()}`);
+  }
   if (sessionSummary && sessionSummary.trim()) {
     systemParts.push(`\nEarlier conversation summary:\n${sessionSummary.trim()}`);
   }
@@ -83,6 +87,7 @@ async function runDeepSeekApi(opts: RunAgentOptions, apiKey: string): Promise<Ag
     opts.cwd,
     opts.sessionSummary,
     opts.summarizedUpTo,
+    opts.skillsPromptBlock,
   );
 
   try {

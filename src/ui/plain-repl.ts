@@ -23,6 +23,12 @@ import {
   saveSession,
   saveSessionAs,
 } from "../session.ts";
+import {
+  buildSkillsPromptBlock,
+  discoverSkills,
+  prependSkillsToPrompt,
+  resolveRequestedSkills,
+} from "../skills.ts";
 import { AGENT_IDS, AGENT_META, formatTargetLabel } from "../types.ts";
 import type { AgentId, AgentTarget, ChatMessage, McliConfig, SessionData, ToolEvent } from "../types.ts";
 import {
@@ -115,9 +121,48 @@ export async function formatModelsReport(
   return lines.join("\n");
 }
 
+export function formatSkillsReport(
+  cwd: string,
+  config: McliConfig,
+  pinnedSkills: string[] = [],
+): string {
+  const skills = discoverSkills(cwd, config);
+  const pinnedSet = new Set(pinnedSkills.map((s) => s.toLowerCase()));
+  const lines: string[] = [
+    "",
+    `${style("mcli", BOLD, FG.brightWhite)} ${style("— Unified Skills across Claude, Codex, Agy, Kimi & Workspace", DIM)}`,
+    style("─".repeat(72), DIM, FG.gray),
+  ];
+
+  if (skills.length === 0) {
+    lines.push(`  ${style("No SKILL.md skills found in ~/.claude/skills, ~/.codex/skills, ~/.agents/skills, or workspace.", DIM)}`);
+  } else {
+    for (const s of skills) {
+      const pinned = pinnedSet.has(s.name.toLowerCase());
+      const mark = pinned ? style("●", FG.brightGreen) : style("○", DIM);
+      const src = style(`[${s.source}]`, FG.cyan);
+      const desc = s.description
+        ? style(` — ${s.description.slice(0, 88)}${s.description.length > 88 ? "…" : ""}`, DIM)
+        : "";
+      lines.push(`  ${mark} ${style(s.name, BOLD, FG.brightWhite)} ${src}${desc}`);
+    }
+  }
+
+  lines.push(style("─".repeat(72), DIM, FG.gray));
+  lines.push(
+    `  ${style("Use on any agent:", DIM)} ${style('mcli --codex --skill <name> "..."', FG.brightWhite)}  or inline  ${style("$<name>", FG.brightGreen)}`,
+  );
+  lines.push(
+    `  ${style("In TUI:", DIM)} ${style("/skill use <name>", BOLD)} to pin for session  •  ${style("/skill show <name>", BOLD)} to inspect`,
+  );
+  lines.push("");
+  return lines.join("\n");
+}
+
 export interface OneShotOptions {
   agents: AgentId[];
   targets?: AgentTarget[];
+  skills?: string[];
   prompt: string;
   config: McliConfig;
   session: SessionData;
@@ -174,6 +219,32 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   const historySnapshot = [...opts.session.messages];
   const transcriptPath = getSessionTranscriptPath(opts.session.id);
 
+  // Merge session-pinned skills with per-turn --skill / $skill requests
+  const requestedSkillNames = Array.from(
+    new Set([...(opts.session.pinnedSkills ?? []), ...(opts.skills ?? [])]),
+  );
+  const discoveredSkills = requestedSkillNames.length > 0 ? discoverSkills(opts.cwd, opts.config) : [];
+  const { resolved: activeSkills, missing: missingSkills } = resolveRequestedSkills(
+    requestedSkillNames,
+    discoveredSkills,
+  );
+  const skillsPromptBlock = buildSkillsPromptBlock(activeSkills);
+
+  if (missingSkills.length > 0) {
+    process.stderr.write(
+      style(`Warning: skill(s) not found: ${missingSkills.join(", ")} (run \`mcli --skills\` to list).\n`, FG.yellow),
+    );
+  }
+  if (activeSkills.length > 0 && Boolean(process.stdout.isTTY)) {
+    process.stderr.write(
+      style(
+        `  ✦ Active skills: ${activeSkills.map((s) => `${s.name} [${s.source}]`).join(", ")}\n`,
+        DIM,
+        FG.brightGreen,
+      ),
+    );
+  }
+
   const userMsg: ChatMessage = {
     id: createMessageId(),
     role: "user",
@@ -209,6 +280,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
         sessionSummary: opts.session.summary,
         summarizedUpTo: opts.session.summarizedUpTo,
         transcriptPath,
+        skills: activeSkills,
         cwd: opts.cwd,
         config: effectiveConfig,
         rounds,
@@ -258,15 +330,18 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
         const adapter = getAdapter(agent);
         const agentConfig = opts.config.agents[agent] ?? {};
         const resolvedModel = target.model;
-        const fullPrompt = buildPromptWithContext({
-          userPrompt: opts.prompt,
-          history: historySnapshot,
-          targetAgent: agent,
-          config: effectiveConfig,
-          sessionSummary: opts.session.summary,
-          summarizedUpTo: opts.session.summarizedUpTo,
-          transcriptPath,
-        });
+        const fullPrompt = prependSkillsToPrompt(
+          buildPromptWithContext({
+            userPrompt: opts.prompt,
+            history: historySnapshot,
+            targetAgent: agent,
+            config: effectiveConfig,
+            sessionSummary: opts.session.summary,
+            summarizedUpTo: opts.session.summarizedUpTo,
+            transcriptPath,
+          }),
+          activeSkills,
+        );
 
         if (multi || isTty) {
           process.stderr.write(
@@ -284,6 +359,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
           sessionSummary: opts.session.summary,
           summarizedUpTo: opts.session.summarizedUpTo,
           transcriptPath,
+          skillsPromptBlock,
           cwd: opts.cwd,
           model: resolvedModel,
           sessionId: opts.session.agentSessions[agent],
@@ -424,12 +500,17 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
     if (line === null) break;
 
     const parsed = parseInlineInput(line);
-    if (!parsed.isSlashCommand && !parsed.listModels && !parsed.switchOnly && !parsed.prompt) {
+    if (!parsed.isSlashCommand && !parsed.listModels && !parsed.listSkills && !parsed.switchOnly && !parsed.prompt) {
       continue;
     }
 
     if (parsed.listModels) {
       console.log(await formatModelsReport(opts.config, parsed.agents));
+      continue;
+    }
+
+    if (parsed.listSkills) {
+      console.log(formatSkillsReport(opts.cwd, opts.config, opts.session.pinnedSkills));
       continue;
     }
 
@@ -579,6 +660,47 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
             FG.cyan,
           ),
         );
+      } else if (cmd === "skills") {
+        console.log(formatSkillsReport(opts.cwd, opts.config, opts.session.pinnedSkills));
+      } else if (cmd === "skill") {
+        const parts = args.split(/\s+/).filter(Boolean);
+        const sub = (parts[0] || "list").toLowerCase();
+        const available = discoverSkills(opts.cwd, opts.config);
+        if (sub === "list") {
+          console.log(formatSkillsReport(opts.cwd, opts.config, opts.session.pinnedSkills));
+        } else if (sub === "clear") {
+          opts.session.pinnedSkills = [];
+          saveSession(opts.session);
+          console.log(style("Cleared all pinned session skills.", FG.green));
+        } else if ((sub === "use" || sub === "add" || sub === "pin") && parts[1]) {
+          const { resolved, missing } = resolveRequestedSkills(parts.slice(1), available);
+          const current = new Set(opts.session.pinnedSkills ?? []);
+          for (const s of resolved) current.add(s.name);
+          opts.session.pinnedSkills = Array.from(current);
+          saveSession(opts.session);
+          if (resolved.length > 0) {
+            console.log(style(`Pinned skill(s): ${resolved.map((s) => s.name).join(", ")}`, FG.green));
+          }
+          if (missing.length > 0) {
+            console.log(style(`Not found: ${missing.join(", ")}`, FG.yellow));
+          }
+        } else if ((sub === "off" || sub === "remove" || sub === "unpin") && parts[1]) {
+          const drop = new Set(parts.slice(1).map((p) => p.toLowerCase()));
+          opts.session.pinnedSkills = (opts.session.pinnedSkills ?? []).filter(
+            (n) => !drop.has(n.toLowerCase()),
+          );
+          saveSession(opts.session);
+          console.log(style(`Updated pinned skills: ${(opts.session.pinnedSkills ?? []).join(", ") || "none"}`, FG.cyan));
+        } else if (sub === "show" && parts[1]) {
+          const { resolved } = resolveRequestedSkills([parts[1]], available);
+          if (resolved[0]) {
+            console.log(`\n${style(resolved[0].name, BOLD)} [${resolved[0].source}] — ${resolved[0].filePath}\n\n${resolved[0].body}\n`);
+          } else {
+            console.log(style(`Skill "${parts[1]}" not found.`, FG.yellow));
+          }
+        } else {
+          console.log(style("Usage: /skill [list | use <name> | off <name> | clear | show <name>]", FG.yellow));
+        }
       } else if (cmd === "models") {
         const filter = args
           .split(/\s+/)
@@ -732,6 +854,7 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
     await runOneShot({
       agents: targets.map((t) => t.agent),
       targets,
+      skills: parsed.skills,
       prompt: parsed.prompt,
       config: { ...opts.config, shareContext, agentDiscussion, discussionRounds },
       session: opts.session,

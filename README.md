@@ -66,6 +66,8 @@ Inside the TUI:
 - `/status` — Show detection status of all 5 agents
 - `/clear` — Clear shared conversation history
 - `/history` — Summarize turns in the current session
+- `/skills` or `--skills` — List all `SKILL.md` skills across Claude, Codex, Agy, Kimi & workspace
+- `/skill [use <name>|off <name>|clear|show <name>]` — Pin/unpin or inspect skills across all agents
 - `/memory [status|set <agent[:model]|auto|local>|mode lean|balanced|full|auto on|off]` — Assign a cheap/fast Scribe agent to manage memory & save tokens
 - `/compact [fast]` — Compress older turns via your Memory Scribe agent (keeps recent turns verbatim)
 - `/context [on|off|show]` — Toggle or inspect 3-tier shared memory & token estimate
@@ -116,6 +118,26 @@ mcli --claude --opus --claude --sonnet --discuss "compare these two proofs"
 - **Round 2..N (Peer Discussion):** Each agent reads the other agents' previous responses, challenges gaps/errors, incorporates valid points, and refines its answer.
 - **Final Synthesis:** Produces a consolidated consensus summary (points of agreement, key disagreements, and final answer). Skip with `--no-synthesis`.
 - **Toggleable default:** Use `/discuss on` (or `/discuss rounds 3`) inside the TUI, or set `"agentDiscussion": true` in `~/.mcli/config.json`. Override per job with `--discuss` / `--agent discussion` or `--no-discuss`.
+
+### Unified Cross-CLI Skills (`--skills`, `--skill`, `$<name>`)
+
+`mcli` automatically discovers your existing `SKILL.md` skills across `~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`, `~/.gemini/antigravity-cli/skills`, `~/.kimi/skills`, `~/.mcli/skills`, and workspace skill folders (plus custom `skillDirs` in `~/.mcli/config.json`) — so you can run **any Claude or Codex skill on any agent**, including DeepSeek and `--agent discussion`:
+
+```bash
+# List every discovered skill across all CLIs
+mcli --skills
+
+# Run a Claude skill on Codex (or vice versa, or on DeepSeek API)
+mcli --codex --skill my-claude-skill "refactor this module"
+
+# Share a skill across multiple firms & models in an agent discussion
+mcli --codex --gpt-5.6-sol --claude --opus --skill my-skill --agent discussion "investigate..."
+```
+
+Inside the TUI:
+- Type **`--skills`** or **`/skills`** to list all skills and their origin (`[claude]`, `[codex]`, `[workspace]`, etc.)
+- Trigger inline with **`$<skill-name>`** (Tab-autocompletes!) or **`--skill <name>`**
+- Pin skills for the whole session with **`/skill use <name>`** (clear with `/skill clear`)
 
 ### Choosing Models
 

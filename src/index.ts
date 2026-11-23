@@ -6,7 +6,13 @@ import { loadOrCreateSession } from "./session.ts";
 import { AGENT_IDS } from "./types.ts";
 import type { AgentId, AgentTarget } from "./types.ts";
 import { BOLD, DIM, FG, style } from "./ui/ansi.ts";
-import { formatDoctorReport, formatModelsReport, runOneShot, runPlainRepl } from "./ui/plain-repl.ts";
+import {
+  formatDoctorReport,
+  formatModelsReport,
+  formatSkillsReport,
+  runOneShot,
+  runPlainRepl,
+} from "./ui/plain-repl.ts";
 import { UnifiedChatTui } from "./ui/tui.ts";
 
 const VERSION = "0.1.0";
@@ -37,6 +43,8 @@ function printHelp(): void {
     style("Options:", BOLD),
     "  -m, --model <name>     Override model for the active/selected agent",
     "  --models               List available & preset models for all (or selected) agents",
+    "  --skills               List all SKILL.md skills across Claude, Codex, Agy, Kimi & workspace",
+    "  --skill <name>         Apply any CLI's skill to any agent (repeatable; or inline $<name>)",
     "  --discuss, --agent discussion  Enable multi-round peer discussion + synthesis across 2+ agents",
     "  --rounds <N>           Number of discussion rounds (default: 2, max: 6)",
     "  --no-synthesis         Skip final consensus synthesis step after discussion rounds",
@@ -92,6 +100,11 @@ export async function main(argv: string[]): Promise<void> {
 
   if (args.listModels) {
     console.log(await formatModelsReport(config, args.agents));
+    return;
+  }
+
+  if (args.listSkills) {
+    console.log(formatSkillsReport(process.cwd(), config));
     return;
   }
 
@@ -153,6 +166,7 @@ export async function main(argv: string[]): Promise<void> {
     const exitCode = await runOneShot({
       agents: resolvedTargets.map((t) => t.agent),
       targets: resolvedTargets,
+      skills: args.skills,
       prompt: combinedPrompt,
       config,
       session,
@@ -167,6 +181,12 @@ export async function main(argv: string[]): Promise<void> {
     });
     process.exitCode = exitCode;
     return;
+  }
+
+  // If user launched interactive mode with --skill <name>, pin them for this session
+  if (args.skills.length > 0) {
+    const merged = new Set([...(session.pinnedSkills ?? []), ...args.skills]);
+    session.pinnedSkills = Array.from(merged);
   }
 
   // Interactive mode: Plain REPL if --plain or non-TTY, else full Unified Chat TUI

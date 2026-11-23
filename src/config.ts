@@ -133,6 +133,9 @@ export function loadConfig(): McliConfig {
             ? parsed.memory.autoCompactThresholdChars
             : defaults.memory.autoCompactThresholdChars,
       },
+      skillDirs: Array.isArray(parsed.skillDirs)
+        ? parsed.skillDirs.filter((d): d is string => typeof d === "string" && d.trim().length > 0)
+        : undefined,
       agents: mergedAgents,
     };
   } catch {

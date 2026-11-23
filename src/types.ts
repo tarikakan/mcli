@@ -100,6 +100,8 @@ export interface McliConfig {
   agentDiscussion: boolean;
   discussionRounds: number;
   memory: MemoryConfig;
+  /** Extra directories to scan for SKILL.md skills */
+  skillDirs?: string[];
   agents: Record<AgentId, AgentConfig>;
 }
 
@@ -136,6 +138,8 @@ export interface SessionData {
   summary?: string;
   /** Index into `messages` up to which turns have already been summarized */
   summarizedUpTo?: number;
+  /** Skill names pinned for every turn in this session */
+  pinnedSkills?: string[];
 }
 
 export interface StreamEvent {
@@ -161,6 +165,7 @@ export interface RunAgentOptions {
   sessionSummary?: string;
   summarizedUpTo?: number;
   transcriptPath?: string;
+  skillsPromptBlock?: string;
   cwd: string;
   model?: string;
   sessionId?: string;
