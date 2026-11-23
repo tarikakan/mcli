@@ -1,8 +1,10 @@
+import { resolveModelAlias } from "./models.ts";
 import { AGENT_IDS } from "./types.ts";
 import type { AgentId } from "./types.ts";
 
 export interface ParsedCliArgs {
   agents: AgentId[];
+  agentModels: Partial<Record<AgentId, string>>;
   promptParts: string[];
   prompt: string;
   model?: string;
@@ -11,6 +13,7 @@ export interface ParsedCliArgs {
   noContext: boolean;
   plain: boolean;
   status: boolean;
+  listModels: boolean;
   initConfig: boolean;
   help: boolean;
   version: boolean;
@@ -20,6 +23,9 @@ export interface ParsedCliArgs {
 
 export interface ParsedInlineInput {
   agents: AgentId[];
+  agentModels: Partial<Record<AgentId, string>>;
+  modelOverride?: string;
+  listModels: boolean;
   prompt: string;
   switchOnly: boolean;
   isSlashCommand: boolean;
@@ -33,27 +39,47 @@ export function isAgentId(value: string): value is AgentId {
   return AGENT_SET.has(value);
 }
 
-export function flagToAgent(token: string): AgentId | undefined {
+export function parseAgentToken(token: string): { agent: AgentId; model?: string } | undefined {
+  let body: string | undefined;
   if (token.startsWith("--")) {
-    const name = token.slice(2).toLowerCase();
-    if (isAgentId(name)) return name;
+    body = token.slice(2);
+  } else if (token.startsWith("@")) {
+    body = token.slice(1);
   }
-  if (token.startsWith("@")) {
-    const name = token.slice(1).toLowerCase();
-    if (isAgentId(name)) return name;
+  if (!body) return undefined;
+
+  const colonIdx = body.indexOf(":");
+  if (colonIdx !== -1) {
+    const name = body.slice(0, colonIdx).toLowerCase();
+    const rawModel = body.slice(colonIdx + 1).trim();
+    if (isAgentId(name) && rawModel.length > 0) {
+      return { agent: name, model: resolveModelAlias(name, rawModel) };
+    }
+    return undefined;
+  }
+
+  const name = body.toLowerCase();
+  if (isAgentId(name)) {
+    return { agent: name };
   }
   return undefined;
+}
+
+export function flagToAgent(token: string): AgentId | undefined {
+  return parseAgentToken(token)?.agent;
 }
 
 export function parseCliArgs(argv: string[]): ParsedCliArgs {
   const result: ParsedCliArgs = {
     agents: [],
+    agentModels: {},
     promptParts: [],
     prompt: "",
     newSession: false,
     noContext: false,
     plain: false,
     status: false,
+    listModels: false,
     initConfig: false,
     help: false,
     version: false,
@@ -76,10 +102,13 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
-    const agent = flagToAgent(arg);
-    if (agent) {
-      if (!result.agents.includes(agent)) {
-        result.agents.push(agent);
+    const parsedAgent = parseAgentToken(arg);
+    if (parsedAgent) {
+      if (!result.agents.includes(parsedAgent.agent)) {
+        result.agents.push(parsedAgent.agent);
+      }
+      if (parsedAgent.model) {
+        result.agentModels[parsedAgent.agent] = parsedAgent.model;
       }
       continue;
     }
@@ -94,6 +123,10 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     }
     if (arg === "--status" || arg === "--doctor") {
       result.status = true;
+      continue;
+    }
+    if (arg === "--models") {
+      result.listModels = true;
       continue;
     }
     if (arg === "--init-config") {
@@ -149,18 +182,22 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
 }
 
 /**
- * Parses an interactive chat message, supporting leading agent flags such as:
+ * Parses an interactive chat message, supporting leading agent/model flags:
  *   "--codex fix the tests"
- *   "--claude --deepseek compare these two designs"
- *   "--agy" (switches active agent without sending a prompt)
+ *   "--claude:opus review this architecture"
+ *   "--claude --model sonnet explain this"
+ *   "--claude:opus --deepseek:reasoner compare these two designs"
+ *   "--agy" or "--claude:opus" (switches active agent / model without sending a prompt)
  *   "@kimi explain this module"
- *   "/help" (slash command)
+ *   "/model" or "/help" (slash command)
  */
 export function parseInlineInput(raw: string): ParsedInlineInput {
   const trimmed = raw.trim();
   if (!trimmed) {
     return {
       agents: [],
+      agentModels: {},
+      listModels: false,
       prompt: "",
       switchOnly: false,
       isSlashCommand: false,
@@ -173,6 +210,8 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
     const commandArgs = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
     return {
       agents: [],
+      agentModels: {},
+      listModels: false,
       prompt: "",
       switchOnly: false,
       isSlashCommand: true,
@@ -182,6 +221,9 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
   }
 
   const agents: AgentId[] = [];
+  const agentModels: Partial<Record<AgentId, string>> = {};
+  let modelOverride: string | undefined;
+  let listModels = false;
   let cursor = trimmed;
 
   while (cursor.length > 0) {
@@ -189,18 +231,44 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
     if (!match) break;
     const token = match[1];
     const rest = (match[2] ?? "").trim();
-    const agent = flagToAgent(token);
-    if (!agent) break;
-    if (!agents.includes(agent)) {
-      agents.push(agent);
+
+    if (token === "--models") {
+      listModels = true;
+      cursor = rest;
+      continue;
+    }
+
+    if (token === "--model" || token === "-m") {
+      const nextMatch = rest.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+      if (!nextMatch) break;
+      modelOverride = nextMatch[1];
+      cursor = (nextMatch[2] ?? "").trim();
+      continue;
+    }
+    if (token.startsWith("--model=")) {
+      modelOverride = token.slice("--model=".length);
+      cursor = rest;
+      continue;
+    }
+
+    const parsedAgent = parseAgentToken(token);
+    if (!parsedAgent) break;
+    if (!agents.includes(parsedAgent.agent)) {
+      agents.push(parsedAgent.agent);
+    }
+    if (parsedAgent.model) {
+      agentModels[parsedAgent.agent] = parsedAgent.model;
     }
     cursor = rest;
   }
 
   return {
     agents,
+    agentModels,
+    modelOverride,
+    listModels,
     prompt: cursor,
-    switchOnly: agents.length > 0 && cursor.length === 0,
+    switchOnly: !listModels && (agents.length > 0 || Boolean(modelOverride)) && cursor.length === 0,
     isSlashCommand: false,
   };
 }

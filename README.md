@@ -50,6 +50,7 @@ Inside the TUI:
 
 | Key | Action |
 | --- | --- |
+| `Ctrl+O` | Open interactive **Model Picker** (`↑`/`↓` select, `Tab` switch agent, `S` save default) |
 | `Tab` / `Shift+Tab` | Autocomplete `--flags` / `/commands`, or cycle active agent |
 | `PgUp` / `PgDn` or `Alt+Up` / `Alt+Down` | Scroll chat history |
 | `Up` / `Down` | Navigate prompt history |
@@ -58,16 +59,38 @@ Inside the TUI:
 
 **Slash Commands:**
 
+- `/model` or `/models` — Open the interactive model picker
+- `/model <name>` — Override model for the active agent (or `/model <agent> <name>`, `/model default`, `/model save`)
 - `/help` — Show flags, shortcuts, and commands
 - `/status` — Show detection status of all 5 agents
 - `/clear` — Clear shared conversation history
 - `/history` — Summarize turns in the current session
 - `/context [on|off]` — Toggle cross-agent context passing
-- `/model <name|default>` — Override model for the active agent
 - `/session [list|load <name>|new <name>]` — Switch or list persistent sessions
 - `/copy` — Copy the last assistant response to clipboard
 - `/export [file.md]` — Export full conversation to Markdown
 - `/config` — Show config file location
+
+### Choosing Models
+
+There are 4 ways to choose models per agent:
+
+1. **Interactive Model Picker (TUI):** Press `Ctrl+O` or type `/model` (or `/models`) inside the TUI. Use `↑`/`↓` to pick a model, `Tab` to switch between agents, `Enter` to apply for the session, or `S` to save as the permanent default in `~/.mcli/config.json`.
+2. **Inline `--agent:model` syntax (TUI & CLI):**
+   ```bash
+   mcli --claude:opus "review this architecture"
+   mcli --deepseek:reasoner "prove this invariant"
+   mcli --claude:opus --codex:o3 "compare two implementations"
+   ```
+   *(Short aliases like `reasoner`/`r1` → `deepseek-reasoner`, `o`/`s`/`h` → `opus`/`sonnet`/`haiku`, `5.3` → `gpt-5.3-codex` are also expanded automatically.)*
+3. **CLI `--model` / `-m` flag & `--models` list:**
+   ```bash
+   mcli --models                      # List preset & detected models for all agents
+   mcli --claude --models             # List models for Claude
+   mcli --codex -m o3 "fix tests"
+   ```
+4. **Persistent defaults & custom models in `~/.mcli/config.json`:**
+   Set `agents.<id>.model` for a default model, or `agents.<id>.models: ["custom-model"]` to add custom models to the interactive picker.
 
 ### 2. One-Shot & Piped CLI Mode
 

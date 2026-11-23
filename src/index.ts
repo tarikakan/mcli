@@ -1,10 +1,12 @@
 import { detectAllAgents, pickInitialAgent } from "./adapters/index.ts";
 import { parseCliArgs } from "./cli-args.ts";
 import { createDefaultConfig, getConfigPath, loadConfig, saveConfig } from "./config.ts";
+import { resolveModelAlias } from "./models.ts";
 import { loadOrCreateSession } from "./session.ts";
 import { AGENT_IDS } from "./types.ts";
+import type { AgentId } from "./types.ts";
 import { BOLD, DIM, FG, style } from "./ui/ansi.ts";
-import { formatDoctorReport, runOneShot, runPlainRepl } from "./ui/plain-repl.ts";
+import { formatDoctorReport, formatModelsReport, runOneShot, runPlainRepl } from "./ui/plain-repl.ts";
 import { UnifiedChatTui } from "./ui/tui.ts";
 
 const VERSION = "0.1.0";
@@ -27,13 +29,14 @@ function printHelp(): void {
     style("Examples:", BOLD),
     "  mcli                                       Open unified chat TUI",
     "  mcli --codex                               Open TUI starting on Codex",
-    '  mcli --claude "explain src/index.ts"       One-shot headless query (saves to shared history)',
-    '  mcli --codex "write tests for it"          Follow up with Codex using shared context',
-    '  mcli --claude --deepseek "compare ideas"   Run multiple agents together',
+    '  mcli --claude:opus "explain src/index.ts"  Pick model inline with --agent:model',
+    '  mcli --codex -m o3 "write tests for it"    Follow up with Codex using shared context',
+    '  mcli --claude:opus --deepseek:reasoner "compare ideas"  Parallel multi-agent + models',
     '  git diff | mcli --agy "review this diff"   Pipe stdin directly to any agent',
     "",
     style("Options:", BOLD),
     "  -m, --model <name>     Override model for the active/selected agent",
+    "  --models               List available & preset models for all (or selected) agents",
     "  -s, --session <name>   Load or create a named shared session",
     "  --new                  Start a fresh session (do not load previous workspace history)",
     "  --no-context           Disable cross-agent context injection for this run",
@@ -83,6 +86,11 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
 
+  if (args.listModels) {
+    console.log(await formatModelsReport(config, args.agents));
+    return;
+  }
+
   if (args.unknownFlags.length > 0) {
     console.error(
       style(`Unknown flag(s): ${args.unknownFlags.join(", ")}`, FG.brightRed) +
@@ -111,6 +119,17 @@ export async function main(argv: string[]): Promise<void> {
     .join("")
     .trim();
 
+  // Merge global --model with per-agent --agent:model overrides
+  const initialAgentModels: Partial<Record<AgentId, string>> = { ...args.agentModels };
+  if (args.model) {
+    const targets = args.agents.length > 0 ? args.agents : [initialAgent];
+    for (const ag of targets) {
+      if (!initialAgentModels[ag]) {
+        initialAgentModels[ag] = resolveModelAlias(ag, args.model);
+      }
+    }
+  }
+
   // One-shot mode if user passed a prompt or piped stdin
   if (combinedPrompt.length > 0) {
     const targetAgents = args.agents.length > 0 ? args.agents : [initialAgent];
@@ -121,6 +140,7 @@ export async function main(argv: string[]): Promise<void> {
       session,
       cwd,
       modelOverride: args.model,
+      agentModels: initialAgentModels,
       noContext: args.noContext,
       saveToSession: true,
     });
@@ -136,6 +156,7 @@ export async function main(argv: string[]): Promise<void> {
       cwd,
       initialAgent,
       modelOverride: args.model,
+      agentModels: initialAgentModels,
     });
     return;
   }
@@ -146,6 +167,7 @@ export async function main(argv: string[]): Promise<void> {
     cwd,
     initialAgent,
     modelOverride: args.model,
+    agentModels: initialAgentModels,
   });
   await tui.start();
 }

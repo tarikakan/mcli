@@ -1,8 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { detectAllAgents, getAdapter } from "../adapters/index.ts";
-import { parseInlineInput } from "../cli-args.ts";
-import { getConfigPath } from "../config.ts";
+import { isAgentId, parseInlineInput } from "../cli-args.ts";
+import { getConfigPath, saveConfig } from "../config.ts";
+import {
+  discoverAllAgentModels,
+  discoverModelsForAgent,
+  getModelsForAgent,
+  resolveModelAlias,
+} from "../models.ts";
+import type { ModelOption } from "../models.ts";
 import {
   buildPromptWithContext,
   createMessageId,
@@ -50,12 +57,51 @@ const SLASH_COMMANDS = [
   "/history",
   "/context",
   "/model",
+  "/models",
+  "/mouse",
   "/session",
   "/copy",
   "/export",
   "/config",
   "/exit",
 ];
+
+export interface ParsedMouseSequence {
+  length: number;
+  wheel?: "up" | "down";
+}
+
+/**
+ * Parses SGR (\x1b[<b;x;yM / m) and legacy X10 (\x1b[Mbxy) terminal mouse
+ * sequences at the start of `rest`. Returns consumed length and wheel direction.
+ */
+export function parseMouseSequence(rest: string): ParsedMouseSequence | undefined {
+  // SGR mouse protocol: ESC [ < Cb ; Cx ; Cy (M|m)
+  const sgr = rest.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
+  if (sgr) {
+    const cb = Number.parseInt(sgr[1], 10);
+    const kind = sgr[4];
+    if (kind === "M" && (cb & 64) !== 0) {
+      const dir = cb & 3;
+      if (dir === 0) return { length: sgr[0].length, wheel: "up" };
+      if (dir === 1) return { length: sgr[0].length, wheel: "down" };
+    }
+    return { length: sgr[0].length };
+  }
+
+  // Legacy X10 mouse protocol: ESC [ M Cb Cx Cy (6 chars total)
+  if (rest.startsWith("\x1b[M") && rest.length >= 6) {
+    const cb = rest.charCodeAt(3) - 32;
+    if ((cb & 64) !== 0) {
+      const dir = cb & 3;
+      if (dir === 0) return { length: 6, wheel: "up" };
+      if (dir === 1) return { length: 6, wheel: "down" };
+    }
+    return { length: 6 };
+  }
+
+  return undefined;
+}
 
 interface LiveStream {
   agent: AgentId;
@@ -74,6 +120,13 @@ export interface TuiOptions {
   cwd: string;
   initialAgent: AgentId;
   modelOverride?: string;
+  agentModels?: Partial<Record<AgentId, string>>;
+}
+
+interface ModelPickerState {
+  agent: AgentId;
+  items: Array<{ id?: string; label: string; note?: string }>;
+  selectedIndex: number;
 }
 
 export class UnifiedChatTui {
@@ -103,6 +156,8 @@ export class UnifiedChatTui {
   private notice = "";
   private noticeExpiresAt = 0;
   private lastCtrlCAt = 0;
+  private mouseEnabled = true;
+  private modelPicker: ModelPickerState | null = null;
   private renderScheduled = false;
   private running = false;
   private resolveExit: (() => void) | null = null;
@@ -114,8 +169,11 @@ export class UnifiedChatTui {
     this.activeAgent = opts.initialAgent;
     this.shareContext = opts.config.shareContext;
     this.availability = detectAllAgents(opts.config);
+    if (opts.agentModels) {
+      this.modelOverrides = { ...opts.agentModels };
+    }
     if (opts.modelOverride) {
-      this.modelOverrides[this.activeAgent] = opts.modelOverride;
+      this.modelOverrides[this.activeAgent] = resolveModelAlias(this.activeAgent, opts.modelOverride);
     }
     this.promptHistory = opts.session.messages
       .filter((m) => m.role === "user")
@@ -154,12 +212,32 @@ export class UnifiedChatTui {
     process.off("SIGHUP", onExitSignal);
   }
 
+  private setMouseTracking(enabled: boolean): void {
+    this.mouseEnabled = enabled;
+    if (enabled) {
+      // Enable normal mouse button/wheel tracking + SGR extended coordinates
+      process.stdout.write("\x1b[?1000h\x1b[?1006h");
+    } else {
+      process.stdout.write("\x1b[?1006l\x1b[?1000l");
+    }
+  }
+
   private enterAltScreen(): void {
     process.stdout.write("\x1b[?1049h\x1b[?25h\x1b[2J\x1b[H");
+    this.setMouseTracking(this.mouseEnabled);
   }
 
   private leaveAltScreen(): void {
-    process.stdout.write("\x1b[?25h\x1b[?1049l");
+    process.stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+  }
+
+  private scrollChat(deltaLines: number): void {
+    const maxScroll = Math.max(0, this.lastTotalLines - this.lastViewportHeight);
+    const next = Math.max(0, Math.min(maxScroll, this.scrollOffset + deltaLines));
+    if (next !== this.scrollOffset) {
+      this.scrollOffset = next;
+      this.scheduleRender();
+    }
   }
 
   private shutdown(): void {
@@ -243,7 +321,8 @@ export class UnifiedChatTui {
       const prefix = tokenMatch[1];
       const lead = prefix.startsWith("--") ? "--" : "@";
       const partial = prefix.slice(lead.length).toLowerCase();
-      const matched = AGENT_IDS.find((id) => id.startsWith(partial) && id !== partial);
+      const candidates = lead === "--" ? [...AGENT_IDS, "models", "model"] : [...AGENT_IDS];
+      const matched = candidates.find((id) => id.startsWith(partial) && id !== partial);
       if (matched) {
         return beforeCursor.slice(0, beforeCursor.length - prefix.length) + lead + matched + " ";
       }
@@ -252,14 +331,201 @@ export class UnifiedChatTui {
     return undefined;
   }
 
+  private buildPickerItems(agent: AgentId, models: ModelOption[]): ModelPickerState["items"] {
+    const current = this.modelOverrides[agent] ?? this.config.agents[agent]?.model;
+    const items: ModelPickerState["items"] = [
+      { id: undefined, label: "(CLI default)", note: "Use the agent CLI's own configured default" },
+      ...models.map((m) => ({
+        id: m.id,
+        label: m.id,
+        note: m.source === "discovered" && m.note ? `[live] ${m.note}` : m.note,
+      })),
+    ];
+    if (current && !items.some((it) => it.id === current)) {
+      items.splice(1, 0, { id: current, label: current, note: "Active session override" });
+    }
+    return items;
+  }
+
+  private openModelPicker(agent: AgentId = this.activeAgent): void {
+    const initialModels = getModelsForAgent(agent, this.config.agents[agent] ?? {});
+    const current = this.modelOverrides[agent] ?? this.config.agents[agent]?.model;
+    const items = this.buildPickerItems(agent, initialModels);
+    const idx = Math.max(
+      0,
+      items.findIndex((it) => it.id === current),
+    );
+    this.modelPicker = { agent, items, selectedIndex: idx };
+    this.scheduleRender();
+
+    // Refresh asynchronously from live CLI / API sources without blocking UI
+    void discoverModelsForAgent(agent, this.config.agents[agent] ?? {}, true).then((fresh) => {
+      if (!this.modelPicker || this.modelPicker.agent !== agent) return;
+      const selectedId = this.modelPicker.items[this.modelPicker.selectedIndex]?.id;
+      const updated = this.buildPickerItems(agent, fresh);
+      const nextIdx = Math.max(
+        0,
+        updated.findIndex((it) => it.id === selectedId),
+      );
+      this.modelPicker = { agent, items: updated, selectedIndex: nextIdx };
+      this.scheduleRender();
+    });
+  }
+
+  private async showAllModelsInChat(filterAgents?: AgentId[]): Promise<void> {
+    const targets = filterAgents && filterAgents.length > 0 ? filterAgents : [...AGENT_IDS];
+    this.setNotice(
+      `Fetching model list for ${targets.length === AGENT_IDS.length ? "all CLIs" : targets.map((a) => `--${a}`).join(", ")}…`,
+      3000,
+    );
+    const allModels = await discoverAllAgentModels(this.config, {
+      agents: targets,
+      forceRefresh: true,
+    });
+    const lines: string[] = [
+      `**Models across ${targets.length === AGENT_IDS.length ? "all 5 CLIs" : targets.map((a) => AGENT_META[a].label).join(", ")}:**`,
+      "",
+    ];
+    for (const id of targets) {
+      const active = this.modelOverrides[id] ?? this.config.agents[id]?.model;
+      const activeTag = active ? ` *(active: \`${active}\`)*` : " *(CLI default)*";
+      lines.push(`### ${AGENT_META[id].label} (\`--${id}\`)${activeTag}`);
+      for (const m of allModels[id]) {
+        const badge = m.source === "discovered" ? " **[live]**" : m.source === "config" ? " **[config]**" : "";
+        const note = m.note ? ` — ${m.note}` : "";
+        lines.push(`- \`${m.id}\`${badge}${note}`);
+      }
+      lines.push("");
+    }
+    lines.push("Tip: Use `--claude:opus <prompt>`, `/model <name>`, or press `Ctrl+O` for the interactive picker.");
+    this.addSystemMessage(lines.join("\n"));
+  }
+
+  private applyModelPickerSelection(persist: boolean): void {
+    if (!this.modelPicker) return;
+    const { agent, items, selectedIndex } = this.modelPicker;
+    const chosen = items[selectedIndex];
+    if (!chosen) return;
+
+    if (chosen.id === undefined) {
+      delete this.modelOverrides[agent];
+      if (persist) {
+        this.config.agents[agent] = { ...this.config.agents[agent], model: undefined };
+        saveConfig(this.config);
+        this.setNotice(`Reset --${agent} to CLI default and saved to ~/.mcli/config.json.`);
+      } else {
+        this.setNotice(`Reset --${agent} to CLI default for this session.`);
+      }
+    } else {
+      this.modelOverrides[agent] = chosen.id;
+      if (persist) {
+        this.config.agents[agent] = { ...this.config.agents[agent], model: chosen.id };
+        saveConfig(this.config);
+        this.setNotice(`Set --${agent} model to "${chosen.id}" and saved to ~/.mcli/config.json.`);
+      } else {
+        this.setNotice(`Set --${agent} model to "${chosen.id}" (press S in picker or /model save to persist).`);
+      }
+    }
+
+    this.activeAgent = agent;
+    this.session.activeAgent = agent;
+    this.modelPicker = null;
+    this.scheduleRender();
+  }
+
+  private handleModelPickerChunk(chunk: string): void {
+    if (!this.modelPicker) return;
+
+    if (parseMouseSequence(chunk)) {
+      let i = 0;
+      let changed = false;
+      while (i < chunk.length) {
+        const mouse = parseMouseSequence(chunk.slice(i));
+        if (!mouse) break;
+        const len = this.modelPicker.items.length;
+        if (mouse.wheel === "up") {
+          this.modelPicker.selectedIndex = (this.modelPicker.selectedIndex - 1 + len) % len;
+          changed = true;
+        } else if (mouse.wheel === "down") {
+          this.modelPicker.selectedIndex = (this.modelPicker.selectedIndex + 1) % len;
+          changed = true;
+        }
+        i += mouse.length;
+      }
+      if (changed) this.scheduleRender();
+      return;
+    }
+
+    if (chunk === "\x1b" || chunk === "q" || chunk === "\x0f" || chunk === "\x03") {
+      this.modelPicker = null;
+      this.scheduleRender();
+      return;
+    }
+
+    if (chunk === "\x1b[A" || chunk === "k") {
+      const len = this.modelPicker.items.length;
+      this.modelPicker.selectedIndex = (this.modelPicker.selectedIndex - 1 + len) % len;
+      this.scheduleRender();
+      return;
+    }
+
+    if (chunk === "\x1b[B" || chunk === "j") {
+      const len = this.modelPicker.items.length;
+      this.modelPicker.selectedIndex = (this.modelPicker.selectedIndex + 1) % len;
+      this.scheduleRender();
+      return;
+    }
+
+    if (chunk === "\t" || chunk === "\x1b[C" || chunk === "l") {
+      const idx = AGENT_IDS.indexOf(this.modelPicker.agent);
+      const next = AGENT_IDS[(idx + 1) % AGENT_IDS.length];
+      this.openModelPicker(next);
+      return;
+    }
+
+    if (chunk === "\x1b[Z" || chunk === "\x1b[D" || chunk === "h") {
+      const idx = AGENT_IDS.indexOf(this.modelPicker.agent);
+      const prev = AGENT_IDS[(idx - 1 + AGENT_IDS.length) % AGENT_IDS.length];
+      this.openModelPicker(prev);
+      return;
+    }
+
+    if (chunk === "\r" || chunk === "\n") {
+      this.applyModelPickerSelection(false);
+      return;
+    }
+
+    if (chunk === "s" || chunk === "S") {
+      this.applyModelPickerSelection(true);
+      return;
+    }
+  }
+
   private handleInputChunk(chunk: string): void {
+    if (this.modelPicker) {
+      this.handleModelPickerChunk(chunk);
+      return;
+    }
+
     let i = 0;
     while (i < chunk.length) {
       const ch = chunk[i];
 
-      // Escape sequences (arrows, PgUp/PgDn, Home/End, Delete, Shift+Tab, Alt+keys)
+      // Escape sequences (mouse wheel, arrows, PgUp/PgDn, Home/End, Delete, Shift+Tab, Alt+keys)
       if (ch === "\x1b") {
         const rest = chunk.slice(i);
+
+        // Mouse wheel & click sequences (SGR and X10)
+        const mouse = parseMouseSequence(rest);
+        if (mouse) {
+          if (mouse.wheel === "up") {
+            this.scrollChat(3);
+          } else if (mouse.wheel === "down") {
+            this.scrollChat(-3);
+          }
+          i += mouse.length;
+          continue;
+        }
 
         // CSI sequences: \x1b[...
         const csi = rest.match(/^\x1b\[([0-9;]*[A-Za-z~])/);
@@ -429,6 +695,13 @@ export class UnifiedChatTui {
         continue;
       }
 
+      // Ctrl+O (Open interactive model picker)
+      if (ch === "\x0f") {
+        this.openModelPicker(this.activeAgent);
+        i++;
+        continue;
+      }
+
       // Ctrl+P / Ctrl+N (history)
       if (ch === "\x10") {
         this.navigateHistory(-1);
@@ -576,12 +849,33 @@ export class UnifiedChatTui {
       return;
     }
 
+    if (parsed.listModels) {
+      await this.showAllModelsInChat(parsed.agents);
+      return;
+    }
+
     if (parsed.switchOnly) {
-      const target = parsed.agents[0];
-      this.activeAgent = target;
-      this.session.activeAgent = target;
+      if (parsed.agents.length > 0) {
+        const target = parsed.agents[0];
+        this.activeAgent = target;
+        this.session.activeAgent = target;
+      }
+      for (const [ag, mod] of Object.entries(parsed.agentModels)) {
+        if (mod) this.modelOverrides[ag as AgentId] = mod;
+      }
+      if (parsed.modelOverride) {
+        this.modelOverrides[this.activeAgent] = resolveModelAlias(
+          this.activeAgent,
+          parsed.modelOverride,
+        );
+      }
       saveSession(this.session);
-      this.setNotice(`Active agent switched to --${target} (${AGENT_META[target].label})`, 2500);
+      const activeMod = this.modelOverrides[this.activeAgent];
+      const modSuffix = activeMod ? ` (model: ${activeMod})` : "";
+      this.setNotice(
+        `Active agent: --${this.activeAgent} (${AGENT_META[this.activeAgent].label})${modSuffix}`,
+        2500,
+      );
       return;
     }
 
@@ -601,7 +895,16 @@ export class UnifiedChatTui {
       this.session.activeAgent = this.activeAgent;
     }
 
-    await this.dispatchAgents(targets, parsed.prompt);
+    const turnModels: Partial<Record<AgentId, string>> = {};
+    for (const ag of targets) {
+      const m =
+        parsed.agentModels[ag] ??
+        (parsed.modelOverride ? resolveModelAlias(ag, parsed.modelOverride) : undefined) ??
+        this.modelOverrides[ag];
+      if (m) turnModels[ag] = m;
+    }
+
+    await this.dispatchAgents(targets, parsed.prompt, turnModels);
   }
 
   private handleSlashCommand(cmd: string, args: string): void {
@@ -619,17 +922,21 @@ export class UnifiedChatTui {
             "",
             "**Switch or route inline with flags:**",
             "- `--claude <prompt>` / `--codex <prompt>` / `--agy <prompt>` / `--deepseek <prompt>` / `--kimi <prompt>`",
-            "- `--codex` alone switches the active default agent",
-            "- `--claude --codex <prompt>` runs multiple agents in parallel in the same window",
+            "- `--claude:opus <prompt>` or `--deepseek:reasoner <prompt>` — choose model inline per turn",
+            "- `--codex` or `--claude:opus` alone switches the active default agent / model",
+            "- `--claude:opus --codex:o3 <prompt>` runs multiple agents with specific models in parallel",
             "- `@claude`, `@codex`, etc. also work as shortcuts",
             "",
             "**Shortcuts:**",
+            "- `Ctrl+O`: open interactive model picker (`Up`/`Down` select, `Tab` switch agent, `S` save default)",
             "- `Tab` / `Shift+Tab`: autocomplete `--flags` or `/commands`, or cycle active agent",
-            "- `PgUp` / `PgDn` or `Alt+Up` / `Alt+Down`: scroll conversation",
+            "- `PgUp` / `PgDn`, mouse wheel, or `Alt+Up` / `Alt+Down`: scroll conversation (hold `Shift`/`Option` to select text, or `/mouse` to toggle)",
             "- `Up` / `Down`: prompt history",
             "- `Ctrl+C` / `Esc`: cancel active streaming response without quitting",
             "",
             "**Slash Commands:**",
+            "- `/model` or `/models` — open interactive model picker",
+            "- `/model <name>` — set model for active agent (or `/model <agent> <name>`, `/model default`, `/model save`)",
             "- `/status` — detect all 5 CLIs & API fallback status",
             "- `/clear` — reset shared conversation history",
             "- `/context [on|off]` — toggle cross-agent context sharing",
@@ -691,15 +998,70 @@ export class UnifiedChatTui {
         );
         return;
 
-      case "model":
-        if (!args || args === "default") {
+      case "mouse":
+        if (args === "on") this.setMouseTracking(true);
+        else if (args === "off") this.setMouseTracking(false);
+        else this.setMouseTracking(!this.mouseEnabled);
+        this.setNotice(
+          `Mouse wheel scrolling ${this.mouseEnabled ? "ON (hold Shift/Option to select text)" : "OFF (native text selection enabled)"}.`,
+        );
+        return;
+
+      case "models": {
+        const filter = args
+          .split(/\s+/)
+          .filter(Boolean)
+          .map((t) => t.replace(/^--/, "").toLowerCase())
+          .filter(isAgentId);
+        void this.showAllModelsInChat(filter);
+        return;
+      }
+
+      case "model": {
+        const parts = args.split(/\s+/).filter(Boolean);
+        if (parts.length === 0) {
+          this.openModelPicker(this.activeAgent);
+          return;
+        }
+        if (parts[0] === "save") {
+          for (const id of AGENT_IDS) {
+            if (this.modelOverrides[id] !== undefined) {
+              this.config.agents[id] = { ...this.config.agents[id], model: this.modelOverrides[id] };
+            }
+          }
+          const savedPath = saveConfig(this.config);
+          this.setNotice(`Saved model defaults to ${savedPath}`);
+          return;
+        }
+        if (parts.length === 1 && isAgentId(parts[0].toLowerCase())) {
+          this.openModelPicker(parts[0].toLowerCase() as AgentId);
+          return;
+        }
+        if (parts.length >= 2 && isAgentId(parts[0].toLowerCase())) {
+          const target = parts[0].toLowerCase() as AgentId;
+          const rawVal = parts.slice(1).join(" ");
+          if (rawVal === "default") {
+            delete this.modelOverrides[target];
+            this.setNotice(`Reset model override for --${target}.`);
+          } else {
+            const resolved = resolveModelAlias(target, rawVal);
+            this.modelOverrides[target] = resolved;
+            this.setNotice(`Set --${target} model to ${resolved} (use /model save to persist).`);
+          }
+          return;
+        }
+        if (parts[0] === "default") {
           delete this.modelOverrides[this.activeAgent];
           this.setNotice(`Reset model override for --${this.activeAgent}.`);
         } else {
-          this.modelOverrides[this.activeAgent] = args;
-          this.setNotice(`Set --${this.activeAgent} model to ${args}.`);
+          const resolved = resolveModelAlias(this.activeAgent, parts.join(" "));
+          this.modelOverrides[this.activeAgent] = resolved;
+          this.setNotice(
+            `Set --${this.activeAgent} model to ${resolved} (use /model save to persist).`,
+          );
         }
         return;
+      }
 
       case "session": {
         const [sub, ...rest] = args.split(/\s+/).filter(Boolean);
@@ -773,7 +1135,11 @@ export class UnifiedChatTui {
     }
   }
 
-  private async dispatchAgents(agents: AgentId[], userPrompt: string): Promise<void> {
+  private async dispatchAgents(
+    agents: AgentId[],
+    userPrompt: string,
+    turnModels: Partial<Record<AgentId, string>> = {},
+  ): Promise<void> {
     const historySnapshot = [...this.session.messages];
 
     const userMsg: ChatMessage = {
@@ -790,7 +1156,7 @@ export class UnifiedChatTui {
     this.activeController = controller;
     this.liveStreams = agents.map((agent) => ({
       agent,
-      model: this.modelOverrides[agent] ?? this.config.agents[agent]?.model,
+      model: turnModels[agent] ?? this.modelOverrides[agent] ?? this.config.agents[agent]?.model,
       text: "",
       reasoning: "",
       tools: [],
@@ -813,6 +1179,7 @@ export class UnifiedChatTui {
           const stream = this.liveStreams[idx];
           const adapter = getAdapter(agent);
           const agentConfig = this.config.agents[agent] ?? {};
+          const effectiveModel = turnModels[agent] ?? this.modelOverrides[agent];
 
           const fullPrompt = buildPromptWithContext({
             userPrompt,
@@ -826,7 +1193,7 @@ export class UnifiedChatTui {
             rawUserPrompt: userPrompt,
             history: historySnapshot,
             cwd: this.cwd,
-            model: this.modelOverrides[agent],
+            model: effectiveModel,
             sessionId: this.session.agentSessions[agent],
             config: agentConfig,
             signal: controller.signal,
@@ -850,17 +1217,17 @@ export class UnifiedChatTui {
           }
           this.scheduleRender();
 
-          return { agent, res };
+          return { agent, res, effectiveModel };
         }),
       );
 
-      for (const { agent, res } of results) {
+      for (const { agent, res, effectiveModel } of results) {
         const agentConfig = this.config.agents[agent] ?? {};
         this.session.messages.push({
           id: createMessageId(),
           role: "assistant",
           agent,
-          model: this.modelOverrides[agent] ?? agentConfig.model,
+          model: effectiveModel ?? agentConfig.model,
           content: res.text,
           reasoning: res.reasoning || undefined,
           tools: res.tools.length > 0 ? res.tools : undefined,
@@ -902,11 +1269,11 @@ export class UnifiedChatTui {
     const dirName = path.basename(this.cwd) || this.cwd;
     const msgCount = this.session.messages.filter((m) => m.role !== "system").length;
     const activeModel = this.modelOverrides[this.activeAgent] ?? this.config.agents[this.activeAgent]?.model;
-    const modelPart = activeModel ? `  •  model: ${activeModel}` : "";
+    const modelPart = activeModel ? `  •  model: ${activeModel}` : "  •  model: default";
     const ctxPart = `context: ${this.shareContext ? "on" : "off"} (${msgCount} msgs)`;
     const row2 = truncateVisible(
       style(
-        ` dir: ${dirName}  •  session: ${this.session.name}  •  ${ctxPart}${modelPart}  •  Tab: cycle  •  /help`,
+        ` dir: ${dirName}  •  session: ${this.session.name}  •  ${ctxPart}${modelPart}  •  Ctrl+O: models  •  /help`,
         DIM,
       ),
       cols,
@@ -1060,8 +1427,73 @@ export class UnifiedChatTui {
     return lines;
   }
 
+  private buildModelPickerLines(cols: number): string[] {
+    if (!this.modelPicker) return [];
+    const { agent, items, selectedIndex } = this.modelPicker;
+    const activeModel = this.modelOverrides[agent] ?? this.config.agents[agent]?.model;
+
+    const tabs = AGENT_IDS.map((id) =>
+      id === agent
+        ? `${agentBg(id)}${FG.black}${BOLD} --${id} ${RESET}`
+        : style(`--${id}`, DIM, agentFg(id)),
+    ).join("  ");
+
+    const lines: string[] = [
+      "",
+      `  ${style("Model Picker", BOLD, FG.brightWhite)}  ${style("(Tab / ← → switch agent)", DIM)}`,
+      `  ${tabs}`,
+      "  " + style("─".repeat(Math.max(10, Math.min(cols - 4, 76))), DIM, FG.gray),
+      "",
+    ];
+
+    items.forEach((item, idx) => {
+      const isCursor = idx === selectedIndex;
+      const isCurrent = item.id === activeModel;
+      const mark = isCurrent ? "●" : "○";
+      const note = item.note ? `  ${item.note}` : "";
+      const rowText = ` ${isCursor ? "▸" : " "} ${mark} ${item.label.padEnd(24)}${note}`;
+      if (isCursor) {
+        lines.push(
+          "  " +
+            truncateVisible(
+              `${agentBg(agent)}${FG.black}${BOLD}${rowText}${RESET}`,
+              cols - 4,
+            ),
+        );
+      } else {
+        const markStyled = isCurrent ? style(mark, FG.brightGreen) : style(mark, DIM);
+        lines.push(
+          "  " +
+            truncateVisible(
+              `   ${markStyled} ${style(item.label.padEnd(24), FG.brightWhite)}${style(note, DIM)}`,
+              cols - 4,
+            ),
+        );
+      }
+    });
+
+    lines.push("");
+    lines.push(
+      "  " +
+        style(
+          "Enter: use for session  •  S: save as default in ~/.mcli/config.json  •  Esc: close",
+          DIM,
+          FG.cyan,
+        ),
+    );
+    lines.push(
+      "  " +
+        style(
+          "Tip: You can also type `/model <any-custom-name>` or inline `--claude:opus <prompt>`.",
+          DIM,
+        ),
+    );
+    lines.push("");
+    return lines;
+  }
+
   private styleInputLine(raw: string): string {
-    // Highlight leading --agent / @agent flags or /command in the prompt box
+    // Highlight leading --agent[:model] / @agent[:model] flags or /command in the prompt box
     if (raw.startsWith("/")) {
       const spaceIdx = raw.search(/\s/);
       if (spaceIdx === -1) return style(raw, FG.brightCyan, BOLD);
@@ -1069,12 +1501,19 @@ export class UnifiedChatTui {
     }
 
     return raw.replace(
-      /^((?:(?:--(?:claude|codex|agy|deepseek|kimi)|@(?:claude|codex|agy|deepseek|kimi))\s*)+)/i,
+      /^((?:(?:--(?:claude|codex|agy|deepseek|kimi)(?::\S+)?|@(?:claude|codex|agy|deepseek|kimi)(?::\S+)?|--model(?:=\S+|\s+\S+)|-m\s+\S+)\s*)+)/i,
       (matched) =>
-        matched.replace(/(--|@)(claude|codex|agy|deepseek|kimi)/gi, (tok, _p, name: string) => {
-          const id = name.toLowerCase() as AgentId;
-          return style(tok, agentFg(id), BOLD);
-        }),
+        matched.replace(
+          /(--|@)(claude|codex|agy|deepseek|kimi)(:\S+)?/gi,
+          (tok, _p, name: string, modelPart?: string) => {
+            const id = name.toLowerCase() as AgentId;
+            if (modelPart) {
+              const base = tok.slice(0, tok.length - modelPart.length);
+              return style(base, agentFg(id), BOLD) + style(modelPart, FG.brightWhite, BOLD);
+            }
+            return style(tok, agentFg(id), BOLD);
+          },
+        ),
     );
   }
 
@@ -1087,16 +1526,21 @@ export class UnifiedChatTui {
     const viewportHeight = Math.max(4, rows - headerLines.length - footerHeight);
     this.lastViewportHeight = viewportHeight;
 
-    const contentLines = this.buildConversationLines(cols);
+    const contentLines = this.modelPicker
+      ? this.buildModelPickerLines(cols)
+      : this.buildConversationLines(cols);
     this.lastTotalLines = contentLines.length;
 
+    const effectiveScroll = this.modelPicker ? 0 : this.scrollOffset;
     const maxScroll = Math.max(0, contentLines.length - viewportHeight);
-    if (this.scrollOffset > maxScroll) {
+    if (!this.modelPicker && this.scrollOffset > maxScroll) {
       this.scrollOffset = maxScroll;
     }
 
-    const endIdx = contentLines.length - this.scrollOffset;
-    const startIdx = Math.max(0, endIdx - viewportHeight);
+    const endIdx = this.modelPicker
+      ? Math.min(contentLines.length, viewportHeight)
+      : contentLines.length - effectiveScroll;
+    const startIdx = this.modelPicker ? 0 : Math.max(0, endIdx - viewportHeight);
     const visibleLines = contentLines.slice(startIdx, endIdx);
 
     while (visibleLines.length < viewportHeight) {
@@ -1104,11 +1548,13 @@ export class UnifiedChatTui {
     }
 
     // Footer divider with status indicator on the right
-    const statusRight = this.activeController
-      ? style(" Streaming… (Ctrl+C / Esc to cancel) ", FG.brightYellow)
-      : this.scrollOffset > 0
-        ? style(` ↑ Scrolled +${this.scrollOffset}L (PgDn to jump down) `, FG.brightCyan)
-        : style(` Ready · --${this.activeAgent} `, agentFg(this.activeAgent));
+    const statusRight = this.modelPicker
+      ? style(` Selecting model for --${this.modelPicker.agent} `, agentFg(this.modelPicker.agent))
+      : this.activeController
+        ? style(" Streaming… (Ctrl+C / Esc to cancel) ", FG.brightYellow)
+        : this.scrollOffset > 0
+          ? style(` ↑ Scrolled +${this.scrollOffset}L (PgDn to jump down) `, FG.brightCyan)
+          : style(` Ready · --${this.activeAgent} `, agentFg(this.activeAgent));
     const statusLen = stripAnsi(statusRight).length;
     const leftRule = Math.max(2, cols - statusLen);
     const footerDivider = style("─".repeat(leftRule), DIM, FG.gray) + statusRight;
@@ -1137,13 +1583,18 @@ export class UnifiedChatTui {
     // Hint / notice bar
     const now = Date.now();
     let hintText: string;
-    if (this.notice && now < this.noticeExpiresAt) {
+    if (this.modelPicker) {
+      hintText = style(
+        " ↑/↓: move  •  Tab/←/→: agent  •  Enter: apply  •  S: save default  •  Esc: close",
+        FG.brightCyan,
+      );
+    } else if (this.notice && now < this.noticeExpiresAt) {
       hintText = style(` ${this.notice}`, FG.brightCyan);
     } else if (suggestion) {
       hintText = style(` Tab: complete "${suggestion.trim()}"`, DIM, FG.cyan);
     } else {
       hintText = style(
-        " Flags: --claude --codex --agy --deepseek --kimi  •  Tab: cycle agent  •  PgUp/PgDn: scroll  •  /help",
+        " --agent[:model]  •  Ctrl+O / /model: pick model  •  Tab: cycle agent  •  /help",
         DIM,
       );
     }
@@ -1163,10 +1614,12 @@ export class UnifiedChatTui {
       out += `\x1b[${r + 1};1H\x1b[2K${frameRows[r]}`;
     }
 
-    // Position real terminal cursor inside the input row
-    const inputRowIndex = headerLines.length + viewportHeight + 2; // 1-based row
-    const cursorCol = Math.min(cols, prefixPlain.length + (this.cursor - windowStart) + 1);
-    out += `\x1b[${inputRowIndex};${cursorCol}H\x1b[?25h`;
+    // Position real terminal cursor inside the input row (hide while model picker is open)
+    if (!this.modelPicker) {
+      const inputRowIndex = headerLines.length + viewportHeight + 2; // 1-based row
+      const cursorCol = Math.min(cols, prefixPlain.length + (this.cursor - windowStart) + 1);
+      out += `\x1b[${inputRowIndex};${cursorCol}H\x1b[?25h`;
+    }
 
     process.stdout.write(out);
   }

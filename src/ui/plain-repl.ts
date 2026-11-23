@@ -2,8 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { detectAllAgents, getAdapter } from "../adapters/index.ts";
-import { parseInlineInput } from "../cli-args.ts";
-import { getConfigPath } from "../config.ts";
+import { isAgentId, parseInlineInput } from "../cli-args.ts";
+import { getConfigPath, saveConfig } from "../config.ts";
+import { discoverAllAgentModels, discoverModelsForAgent, resolveModelAlias } from "../models.ts";
 import {
   buildPromptWithContext,
   createMessageId,
@@ -58,6 +59,52 @@ export function formatDoctorReport(config: McliConfig): string {
   return lines.join("\n");
 }
 
+export async function formatModelsReport(
+  config: McliConfig,
+  filterAgents?: AgentId[],
+): Promise<string> {
+  const targets = filterAgents && filterAgents.length > 0 ? filterAgents : [...AGENT_IDS];
+  const allModels = await discoverAllAgentModels(config, {
+    agents: targets,
+    forceRefresh: true,
+  });
+  const lines: string[] = [
+    "",
+    `${style("mcli", BOLD, FG.brightWhite)} ${style("— Models across CLIs", DIM)}`,
+    style("─".repeat(68), DIM, FG.gray),
+  ];
+
+  for (const id of targets) {
+    const configured = config.agents[id]?.model;
+    const currentLabel = configured
+      ? style(`default: ${configured}`, FG.brightCyan)
+      : style("default: CLI default", DIM);
+    lines.push(`  ${agentBadge(id, false)} ${style(`(--${id})`, DIM)}  ${currentLabel}`);
+    for (const m of allModels[id]) {
+      const activeMark = configured === m.id ? style("●", FG.brightGreen) : style("○", DIM);
+      const sourceTag =
+        m.source === "discovered"
+          ? style(" [live]", FG.brightGreen)
+          : m.source === "config"
+            ? style(" [config]", FG.brightCyan)
+            : "";
+      const note = m.note ? style(` — ${m.note}`, DIM) : "";
+      lines.push(`    ${activeMark} ${style(m.id, FG.brightWhite)}${sourceTag}${note}`);
+    }
+    lines.push("");
+  }
+
+  lines.push(style("─".repeat(68), DIM, FG.gray));
+  lines.push(
+    `  ${style("Quick select:", DIM)} ${style('mcli --claude:opus "..."', FG.brightWhite)}  or  ${style('mcli --deepseek --model deepseek-reasoner "..."', FG.brightWhite)}`,
+  );
+  lines.push(
+    `  ${style("In TUI:", DIM)} type ${style("--models", BOLD)} for all CLIs, or press ${style("Ctrl+O", BOLD)} / ${style("/model", BOLD)} for the picker`,
+  );
+  lines.push("");
+  return lines.join("\n");
+}
+
 export interface OneShotOptions {
   agents: AgentId[];
   prompt: string;
@@ -65,6 +112,7 @@ export interface OneShotOptions {
   session: SessionData;
   cwd: string;
   modelOverride?: string;
+  agentModels?: Partial<Record<AgentId, string>>;
   noContext?: boolean;
   saveToSession?: boolean;
 }
@@ -102,6 +150,9 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
 
       const adapter = getAdapter(agent);
       const agentConfig = opts.config.agents[agent] ?? {};
+      const resolvedModel =
+        opts.agentModels?.[agent] ??
+        (opts.modelOverride ? resolveModelAlias(agent, opts.modelOverride) : undefined);
       const fullPrompt = buildPromptWithContext({
         userPrompt: opts.prompt,
         history: historySnapshot,
@@ -111,7 +162,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
 
       if (multi || isTty) {
         process.stderr.write(
-          `\n${agentBadge(agent, true)} ${style(`--${agent}`, DIM)}${opts.modelOverride ? style(` (${opts.modelOverride})`, DIM) : ""}\n`,
+          `\n${agentBadge(agent, true)} ${style(`--${agent}`, DIM)}${resolvedModel ? style(` (${resolvedModel})`, DIM) : ""}\n`,
         );
       }
 
@@ -123,7 +174,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
         rawUserPrompt: opts.prompt,
         history: historySnapshot,
         cwd: opts.cwd,
-        model: opts.modelOverride,
+        model: resolvedModel,
         sessionId: opts.session.agentSessions[agent],
         config: agentConfig,
         signal: controller.signal,
@@ -155,7 +206,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
         id: createMessageId(),
         role: "assistant",
         agent,
-        model: opts.modelOverride ?? agentConfig.model,
+        model: resolvedModel ?? agentConfig.model,
         content: result.text,
         reasoning: result.reasoning || undefined,
         tools: tools.length > 0 ? tools : undefined,
@@ -188,14 +239,15 @@ export interface PlainReplOptions {
   cwd: string;
   initialAgent: AgentId;
   modelOverride?: string;
+  agentModels?: Partial<Record<AgentId, string>>;
 }
 
 export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
   let activeAgent: AgentId = opts.initialAgent;
   let shareContext = opts.config.shareContext;
-  const modelOverrides: Partial<Record<AgentId, string>> = {};
+  const modelOverrides: Partial<Record<AgentId, string>> = { ...opts.agentModels };
   if (opts.modelOverride) {
-    modelOverrides[activeAgent] = opts.modelOverride;
+    modelOverrides[activeAgent] = resolveModelAlias(activeAgent, opts.modelOverride);
   }
 
   console.log(formatDoctorReport(opts.config));
@@ -238,7 +290,12 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
     if (line === null) break;
 
     const parsed = parseInlineInput(line);
-    if (!parsed.isSlashCommand && !parsed.switchOnly && !parsed.prompt) {
+    if (!parsed.isSlashCommand && !parsed.listModels && !parsed.switchOnly && !parsed.prompt) {
+      continue;
+    }
+
+    if (parsed.listModels) {
+      console.log(await formatModelsReport(opts.config, parsed.agents));
       continue;
     }
 
@@ -277,13 +334,49 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
         else if (args === "off") shareContext = false;
         else shareContext = !shareContext;
         console.log(style(`Shared cross-agent context: ${shareContext ? "ON" : "OFF"}`, FG.cyan));
+      } else if (cmd === "models") {
+        const filter = args
+          .split(/\s+/)
+          .filter(Boolean)
+          .map((t) => t.replace(/^--/, "").toLowerCase())
+          .filter(isAgentId);
+        console.log(await formatModelsReport(opts.config, filter));
       } else if (cmd === "model") {
-        if (!args || args === "default") {
+        const parts = args.split(/\s+/).filter(Boolean);
+        if (parts.length === 0) {
+          const models = await discoverModelsForAgent(activeAgent, opts.config.agents[activeAgent] ?? {}, true);
+          const cur = modelOverrides[activeAgent] ?? opts.config.agents[activeAgent]?.model ?? "(CLI default)";
+          console.log(`\n${agentBadge(activeAgent, false)} current model: ${style(cur, BOLD)}`);
+          for (const m of models) {
+            console.log(`  - ${style(m.id, FG.brightWhite)}${m.note ? style(` — ${m.note}`, DIM) : ""}`);
+          }
+          console.log(style("  Use `/model <name>`, `/model <agent> <name>`, `/model default`, `/model save`, or `--models` for all CLIs.\n", DIM));
+        } else if (parts[0] === "save") {
+          for (const id of AGENT_IDS) {
+            if (modelOverrides[id] !== undefined) {
+              opts.config.agents[id] = { ...opts.config.agents[id], model: modelOverrides[id] };
+            }
+          }
+          const savedPath = saveConfig(opts.config);
+          console.log(style(`Saved model defaults to ${savedPath}`, FG.green));
+        } else if (parts.length >= 2 && isAgentId(parts[0].toLowerCase())) {
+          const target = parts[0].toLowerCase() as AgentId;
+          const val = parts.slice(1).join(" ");
+          if (val === "default") {
+            delete modelOverrides[target];
+            console.log(style(`Reset model override for --${target}.`, FG.cyan));
+          } else {
+            const resolved = resolveModelAlias(target, val);
+            modelOverrides[target] = resolved;
+            console.log(style(`Set --${target} model to ${resolved}.`, FG.cyan));
+          }
+        } else if (parts[0] === "default") {
           delete modelOverrides[activeAgent];
           console.log(style(`Reset model override for --${activeAgent}.`, FG.cyan));
         } else {
-          modelOverrides[activeAgent] = args;
-          console.log(style(`Set --${activeAgent} model override to ${args}.`, FG.cyan));
+          const resolved = resolveModelAlias(activeAgent, parts.join(" "));
+          modelOverrides[activeAgent] = resolved;
+          console.log(style(`Set --${activeAgent} model to ${resolved}.`, FG.cyan));
         }
       } else if (cmd === "history") {
         if (opts.session.messages.length === 0) {
@@ -331,10 +424,24 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
     }
 
     if (parsed.switchOnly) {
-      activeAgent = parsed.agents[0];
-      opts.session.activeAgent = activeAgent;
+      if (parsed.agents.length > 0) {
+        activeAgent = parsed.agents[0];
+        opts.session.activeAgent = activeAgent;
+      }
+      for (const [ag, mod] of Object.entries(parsed.agentModels)) {
+        if (mod) modelOverrides[ag as AgentId] = mod;
+      }
+      if (parsed.modelOverride) {
+        modelOverrides[activeAgent] = resolveModelAlias(activeAgent, parsed.modelOverride);
+      }
       saveSession(opts.session);
-      console.log(style(`Active agent switched to --${activeAgent} (${AGENT_META[activeAgent].label}).`, agentFg(activeAgent)));
+      const modLabel = modelOverrides[activeAgent] ? ` (model: ${modelOverrides[activeAgent]})` : "";
+      console.log(
+        style(
+          `Active agent: --${activeAgent} (${AGENT_META[activeAgent].label})${modLabel}`,
+          agentFg(activeAgent),
+        ),
+      );
       continue;
     }
 
@@ -343,13 +450,22 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
       activeAgent = parsed.agents[0];
     }
 
+    const turnModels: Partial<Record<AgentId, string>> = {};
+    for (const ag of targetAgents) {
+      const m =
+        parsed.agentModels[ag] ??
+        (parsed.modelOverride ? resolveModelAlias(ag, parsed.modelOverride) : undefined) ??
+        modelOverrides[ag];
+      if (m) turnModels[ag] = m;
+    }
+
     await runOneShot({
       agents: targetAgents,
       prompt: parsed.prompt,
       config: { ...opts.config, shareContext },
       session: opts.session,
       cwd: opts.cwd,
-      modelOverride: targetAgents.length === 1 ? modelOverrides[targetAgents[0]] : undefined,
+      agentModels: turnModels,
       saveToSession: true,
     });
   }

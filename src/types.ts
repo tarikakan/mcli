@@ -55,6 +55,8 @@ export interface AgentConfig {
   extraArgs?: string[];
   outputMode?: "stream-json" | "text";
   model?: string;
+  /** Optional custom model list shown in the `/model` picker & `--models` */
+  models?: string[];
   env?: Record<string, string>;
   /** DeepSeek / OpenAI-compatible API fallback settings */
   apiKey?: string;
