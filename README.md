@@ -18,7 +18,8 @@
 ## Install Globally (`mcli`)
 
 ```bash
-cd /Users/tarikak/Desktop/codes/mcli
+git clone https://github.com/tarikakan/mcli.git
+cd mcli
 npm link
 ```
 
