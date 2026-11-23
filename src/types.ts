@@ -116,6 +116,10 @@ export interface SessionData {
   activeAgent: AgentId;
   messages: ChatMessage[];
   agentSessions: Partial<Record<AgentId, string>>;
+  /** Tier 1 rolling summary of older compacted conversation turns */
+  summary?: string;
+  /** Index into `messages` up to which turns have already been summarized */
+  summarizedUpTo?: number;
 }
 
 export interface StreamEvent {
@@ -138,6 +142,9 @@ export interface RunAgentOptions {
   prompt: string;
   rawUserPrompt: string;
   history: ChatMessage[];
+  sessionSummary?: string;
+  summarizedUpTo?: number;
+  transcriptPath?: string;
   cwd: string;
   model?: string;
   sessionId?: string;

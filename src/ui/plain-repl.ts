@@ -8,11 +8,15 @@ import { runAgentDiscussion } from "../discussion.ts";
 import { discoverAllAgentModels, discoverModelsForAgent, resolveModelAlias } from "../models.ts";
 import {
   buildPromptWithContext,
+  buildSharedContextBlock,
+  compactSession,
   createMessageId,
   exportSessionMarkdown,
+  getSessionTranscriptPath,
   listSessions,
   loadOrCreateSession,
   saveSession,
+  saveSessionAs,
 } from "../session.ts";
 import { AGENT_IDS, AGENT_META, formatTargetLabel } from "../types.ts";
 import type { AgentId, AgentTarget, ChatMessage, McliConfig, SessionData, ToolEvent } from "../types.ts";
@@ -158,6 +162,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
 
   const targets = normalizeTargets(opts);
   const historySnapshot = [...opts.session.messages];
+  const transcriptPath = getSessionTranscriptPath(opts.session.id);
 
   const userMsg: ChatMessage = {
     id: createMessageId(),
@@ -191,6 +196,9 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
         targets,
         userPrompt: opts.prompt,
         history: historySnapshot,
+        sessionSummary: opts.session.summary,
+        summarizedUpTo: opts.session.summarizedUpTo,
+        transcriptPath,
         cwd: opts.cwd,
         config: effectiveConfig,
         rounds,
@@ -245,6 +253,9 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
           history: historySnapshot,
           targetAgent: agent,
           config: effectiveConfig,
+          sessionSummary: opts.session.summary,
+          summarizedUpTo: opts.session.summarizedUpTo,
+          transcriptPath,
         });
 
         if (multi || isTty) {
@@ -260,6 +271,9 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
           prompt: fullPrompt,
           rawUserPrompt: opts.prompt,
           history: historySnapshot,
+          sessionSummary: opts.session.summary,
+          summarizedUpTo: opts.session.summarizedUpTo,
+          transcriptPath,
           cwd: opts.cwd,
           model: resolvedModel,
           sessionId: opts.session.agentSessions[agent],
@@ -419,13 +433,58 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
       } else if (cmd === "clear") {
         opts.session.messages = [];
         opts.session.agentSessions = {};
+        opts.session.summary = undefined;
+        opts.session.summarizedUpTo = undefined;
         saveSession(opts.session);
-        console.log(style("Cleared conversation history.", FG.green));
+        console.log(style("Cleared conversation history and rolling summary.", FG.green));
+      } else if (cmd === "compact") {
+        const fast = args.trim().toLowerCase() === "fast";
+        console.log(style(fast ? "Compacting older turns locally…" : `Compacting older turns with --${activeAgent}…`, DIM));
+        const res = await compactSession({
+          session: opts.session,
+          cwd: opts.cwd,
+          keepRecentTurns: 2,
+          fast,
+          adapter: fast ? undefined : getAdapter(activeAgent),
+          agentConfig: opts.config.agents[activeAgent],
+          model: modelOverrides[activeAgent],
+        });
+        if (res.compactedTurns === 0) {
+          console.log(style("Nothing old enough to compact yet (keeping last 2 turns verbatim).", FG.yellow));
+        } else {
+          console.log(style(`Compacted ${res.compactedTurns} turn(s) into rolling summary (${res.mode}).`, FG.green));
+        }
       } else if (cmd === "context") {
-        if (args === "on") shareContext = true;
-        else if (args === "off") shareContext = false;
-        else shareContext = !shareContext;
-        console.log(style(`Shared cross-agent context: ${shareContext ? "ON" : "OFF"}`, FG.cyan));
+        if (args === "on") {
+          shareContext = true;
+          console.log(style("Shared cross-agent context: ON", FG.cyan));
+        } else if (args === "off") {
+          shareContext = false;
+          console.log(style("Shared cross-agent context: OFF", FG.cyan));
+        } else if (args === "show" || args === "status") {
+          const { stats } = buildSharedContextBlock({
+            history: opts.session.messages,
+            targetAgent: activeAgent,
+            config: { ...opts.config, shareContext },
+            sessionSummary: opts.session.summary,
+            summarizedUpTo: opts.session.summarizedUpTo,
+            transcriptPath: getSessionTranscriptPath(opts.session.id),
+          });
+          console.log(
+            [
+              style("\nShared Memory Status:", BOLD),
+              `  Enabled: ${shareContext ? "ON" : "OFF"}`,
+              `  Rolling summary: ${opts.session.summary ? `present (${opts.session.summarizedUpTo ?? 0} msgs compacted)` : "none (run /compact to create)"}`,
+              `  Active context window: ${stats.includedTurns} turn(s) (~${stats.estimatedTokens} tokens, ${stats.contextChars} chars)`,
+              `  Folded older discussions: ${stats.foldedDiscussions}`,
+              `  Auto-digested overflow turns: ${stats.overflowDigestedTurns}`,
+              `  Transcript file: ${stats.transcriptPath ?? "n/a"}\n`,
+            ].join("\n"),
+          );
+        } else {
+          shareContext = !shareContext;
+          console.log(style(`Shared cross-agent context: ${shareContext ? "ON" : "OFF"}`, FG.cyan));
+        }
       } else if (cmd === "discuss" || cmd === "discussion") {
         const parts = args.split(/\s+/).filter(Boolean);
         if (parts[0] === "on") {
@@ -502,12 +561,22 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
           }
         }
       } else if (cmd === "session") {
-        const [sub, name] = args.split(/\s+/);
+        const [sub, ...rest] = args.split(/\s+/).filter(Boolean);
+        const name = rest.join("-");
         if (!sub || sub === "list") {
           const all = listSessions();
           for (const s of all.slice(0, 15)) {
-            console.log(`  ${s.id} (${s.messageCount} msgs) — ${s.cwd}`);
+            const sumMark = s.hasSummary ? " [summary]" : "";
+            console.log(`  ${s.id} (${s.messageCount} msgs${sumMark}) — ${s.cwd}`);
           }
+        } else if (sub === "save" && name) {
+          opts.session = saveSessionAs(opts.session, name);
+          console.log(
+            style(
+              `Saved session snapshot as "${opts.session.id}" (${getSessionTranscriptPath(opts.session.id)}).`,
+              FG.green,
+            ),
+          );
         } else if ((sub === "load" || sub === "new") && name) {
           opts.session = loadOrCreateSession({
             name,

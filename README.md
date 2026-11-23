@@ -65,11 +65,20 @@ Inside the TUI:
 - `/status` — Show detection status of all 5 agents
 - `/clear` — Clear shared conversation history
 - `/history` — Summarize turns in the current session
-- `/context [on|off]` — Toggle cross-agent context passing
-- `/session [list|load <name>|new <name>]` — Switch or list persistent sessions
+- `/compact [fast]` — Compress older turns into rolling shared memory (keeps last 2 turns verbatim)
+- `/context [on|off|show]` — Toggle or inspect 3-tier shared memory & token estimate
+- `/session [list|save <name>|load <name>|new <name>]` — Snapshot, switch, or list persistent sessions
 - `/copy` — Copy the last assistant response to clipboard
 - `/export [file.md]` — Export full conversation to Markdown
 - `/config` — Show config file location
+
+### 3-Tier Shared Conversation Memory
+
+Every agent automatically knows what happened earlier in the conversation — even across multiple firms and multi-round discussions:
+
+1. **Tier 1 — Rolling Summary (`/compact` + Auto-Digest):** Compresses older turns into a persistent `summary` inside `~/.mcli/sessions/<id>.json` (keeping the last 2 turns verbatim). Even before compacting, turns overflowing the context budget are auto-digested so nothing is silently lost.
+2. **Tier 2 — Smart Discussion Folding:** Older multi-round discussions automatically fold superseded Round 1/2 drafts down to their **`Final Synthesis`** + participant list, preserving conclusions while saving ~70% of context budget.
+3. **Tier 3 — Auto-Synced Markdown Transcript (`~/.mcli/sessions/<id>.md`):** Every save also updates a clean Markdown log and passes its path in `<shared_conversation_history transcript_file="...">`, so coding agents with file tools (`claude`, `codex`, `agy`, `kimi`) can read verbatim earlier details on demand.
 
 ### Multi-Firm / Multi-Model Jobs & Optional Agent Discussion
 

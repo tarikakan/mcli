@@ -13,11 +13,15 @@ import {
 import type { ModelOption } from "../models.ts";
 import {
   buildPromptWithContext,
+  buildSharedContextBlock,
+  compactSession,
   createMessageId,
   exportSessionMarkdown,
+  getSessionTranscriptPath,
   listSessions,
   loadOrCreateSession,
   saveSession,
+  saveSessionAs,
 } from "../session.ts";
 import { AGENT_IDS, AGENT_META, formatTargetLabel } from "../types.ts";
 import type {
@@ -56,6 +60,7 @@ const SLASH_COMMANDS = [
   "/status",
   "/agents",
   "/clear",
+  "/compact",
   "/history",
   "/context",
   "/discuss",
@@ -975,10 +980,11 @@ export class UnifiedChatTui {
             "- `/model` or `--models` — open model picker or list models across all 5 CLIs",
             "- `/model <name>` — set model for active agent (or `/model <agent> <name>`, `/model default`, `/model save`)",
             "- `/status` — detect all 5 CLIs & API fallback status",
-            "- `/clear` — reset shared conversation history",
-            "- `/context [on|off]` — toggle cross-agent context sharing",
+            "- `/compact [fast]` — compress older turns into rolling shared memory (keeps last 2 turns verbatim)",
+            "- `/context [on|off|show]` — toggle or inspect shared memory & token usage sent to agents",
+            "- `/clear` — reset shared conversation history and summary",
             "- `/mouse [on|off]` — toggle mouse wheel scrolling vs native text selection",
-            "- `/session [list|load <name>|new <name>]` — manage sessions",
+            "- `/session [list|save <name>|load <name>|new <name>]` — manage persistent sessions",
             "- `/copy` — copy last assistant response to clipboard",
             "- `/export [file.md]` — export conversation to Markdown",
             "- `/config` — show config file path",
@@ -1005,10 +1011,49 @@ export class UnifiedChatTui {
       case "clear":
         this.session.messages = [];
         this.session.agentSessions = {};
+        this.session.summary = undefined;
+        this.session.summarizedUpTo = undefined;
         saveSession(this.session);
         this.scrollOffset = 0;
-        this.setNotice("Cleared shared conversation history.");
+        this.setNotice("Cleared shared conversation history and rolling summary.");
         return;
+
+      case "compact": {
+        if (this.activeController) {
+          this.setNotice("Wait for active generation to finish before compacting.");
+          return;
+        }
+        const fast = args.trim().toLowerCase() === "fast";
+        this.setNotice(
+          fast
+            ? "Compacting older turns into rolling summary…"
+            : `Compacting older turns using --${this.activeAgent}…`,
+          6000,
+        );
+        void compactSession({
+          session: this.session,
+          cwd: this.cwd,
+          keepRecentTurns: 2,
+          fast,
+          adapter: fast ? undefined : getAdapter(this.activeAgent),
+          agentConfig: this.config.agents[this.activeAgent],
+          model: this.modelOverrides[this.activeAgent],
+        }).then((res) => {
+          if (res.compactedTurns === 0) {
+            this.setNotice("Not enough older turns to compact yet (last 2 turns stay verbatim).");
+          } else {
+            this.addSystemMessage(
+              [
+                `**Compacted ${res.compactedTurns} earlier turn(s) into rolling shared memory (${res.mode}):**`,
+                "",
+                res.summary,
+              ].join("\n"),
+            );
+            this.setNotice(`Rolling summary saved (${res.compactedTurns} turns compacted).`);
+          }
+        });
+        return;
+      }
 
       case "history": {
         if (this.session.messages.length === 0) {
@@ -1027,12 +1072,42 @@ export class UnifiedChatTui {
       }
 
       case "context":
-        if (args === "on") this.shareContext = true;
-        else if (args === "off") this.shareContext = false;
-        else this.shareContext = !this.shareContext;
-        this.setNotice(
-          `Shared cross-agent context is now ${this.shareContext ? "ON" : "OFF"} (max ${this.config.maxContextTurns} turns).`,
-        );
+        if (args === "on") {
+          this.shareContext = true;
+          this.setNotice(`Shared cross-agent context is now ON (max ${this.config.maxContextTurns} turns).`);
+        } else if (args === "off") {
+          this.shareContext = false;
+          this.setNotice("Shared cross-agent context is now OFF.");
+        } else if (args === "show" || args === "status") {
+          const transcriptPath = getSessionTranscriptPath(this.session.id);
+          const { contextBlock, stats } = buildSharedContextBlock({
+            history: this.session.messages,
+            targetAgent: this.activeAgent,
+            config: { ...this.config, shareContext: this.shareContext },
+            sessionSummary: this.session.summary,
+            summarizedUpTo: this.session.summarizedUpTo,
+            transcriptPath,
+          });
+          const lines = [
+            `**Shared Conversation Memory (3-Tier)**`,
+            "",
+            `- **Status:** ${this.shareContext ? "ON" : "OFF"} (next target: \`--${this.activeAgent}\`)`,
+            `- **Tier 1 (Rolling Summary):** ${this.session.summary ? `active (${this.session.summarizedUpTo ?? 0} msgs compacted)` : "none yet — run \`/compact\` to summarize older turns"}`,
+            `- **Tier 2 (Active Window):** ${stats.includedTurns} turn(s) · ~${stats.estimatedTokens} tokens (${stats.contextChars} chars) · ${stats.foldedDiscussions} older discussion(s) folded · ${stats.overflowDigestedTurns} overflow turn(s) auto-digested`,
+            `- **Tier 3 (Full Transcript File):** \`${transcriptPath}\``,
+          ];
+          if (this.session.summary?.trim()) {
+            lines.push("", "**Current Rolling Summary:**", "", this.session.summary.trim());
+          } else if (!contextBlock) {
+            lines.push("", "*No shared history yet.*");
+          }
+          this.addSystemMessage(lines.join("\n"));
+        } else {
+          this.shareContext = !this.shareContext;
+          this.setNotice(
+            `Shared cross-agent context is now ${this.shareContext ? "ON" : "OFF"} (use /context show to inspect).`,
+          );
+        }
         return;
 
       case "discuss":
@@ -1135,10 +1210,18 @@ export class UnifiedChatTui {
             const lines = ["**Saved Sessions:**", ""];
             for (const s of all.slice(0, 12)) {
               const mark = s.id === this.session.id ? " *(current)*" : "";
-              lines.push(`- \`${s.id}\`${mark} — ${s.messageCount} msgs (${s.cwd})`);
+              const sum = s.hasSummary ? " · has summary" : "";
+              lines.push(`- \`${s.id}\`${mark} — ${s.messageCount} msgs${sum} (${s.cwd})`);
             }
             this.addSystemMessage(lines.join("\n"));
           }
+          return;
+        }
+        if (sub === "save" && targetName) {
+          this.session = saveSessionAs(this.session, targetName);
+          this.setNotice(
+            `Saved session snapshot as "${this.session.id}" (+ .md transcript).`,
+          );
           return;
         }
         if ((sub === "load" || sub === "new") && targetName) {
@@ -1153,7 +1236,7 @@ export class UnifiedChatTui {
           this.setNotice(`Session "${this.session.name}" active (${this.session.messages.length} msgs).`);
           return;
         }
-        this.setNotice("Usage: /session [list | load <name> | new <name>]");
+        this.setNotice("Usage: /session [list | save <name> | load <name> | new <name>]");
         return;
       }
 
@@ -1202,6 +1285,7 @@ export class UnifiedChatTui {
     discussionOpts: { discuss: boolean; rounds: number; synthesize: boolean },
   ): Promise<void> {
     const historySnapshot = [...this.session.messages];
+    const transcriptPath = getSessionTranscriptPath(this.session.id);
 
     const targetListLabel =
       targets.length > 1
@@ -1253,6 +1337,9 @@ export class UnifiedChatTui {
           targets,
           userPrompt,
           history: historySnapshot,
+          sessionSummary: this.session.summary,
+          summarizedUpTo: this.session.summarizedUpTo,
+          transcriptPath,
           cwd: this.cwd,
           config: effectiveConfig,
           rounds: discussionOpts.rounds,
@@ -1338,12 +1425,18 @@ export class UnifiedChatTui {
               history: historySnapshot,
               targetAgent: target.agent,
               config: effectiveConfig,
+              sessionSummary: this.session.summary,
+              summarizedUpTo: this.session.summarizedUpTo,
+              transcriptPath,
             });
 
             const res = await adapter.run({
               prompt: fullPrompt,
               rawUserPrompt: userPrompt,
               history: historySnapshot,
+              sessionSummary: this.session.summary,
+              summarizedUpTo: this.session.summarizedUpTo,
+              transcriptPath,
               cwd: this.cwd,
               model: target.model,
               sessionId: this.session.agentSessions[target.agent],

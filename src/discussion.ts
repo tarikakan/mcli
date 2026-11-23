@@ -22,6 +22,9 @@ export interface RunDiscussionOptions {
   targets: AgentTarget[];
   userPrompt: string;
   history: ChatMessage[];
+  sessionSummary?: string;
+  summarizedUpTo?: number;
+  transcriptPath?: string;
   cwd: string;
   config: McliConfig;
   rounds: number;
@@ -165,6 +168,9 @@ export async function runAgentDiscussion(
       prompt,
       rawUserPrompt,
       history: opts.history,
+      sessionSummary: opts.sessionSummary,
+      summarizedUpTo: opts.summarizedUpTo,
+      transcriptPath: opts.transcriptPath,
       cwd: opts.cwd,
       model: target.model,
       config: agentConfig,
@@ -210,6 +216,9 @@ export async function runAgentDiscussion(
         history: opts.history,
         targetAgent: target.agent,
         config: opts.config,
+        sessionSummary: opts.sessionSummary,
+        summarizedUpTo: opts.summarizedUpTo,
+        transcriptPath: opts.transcriptPath,
       });
 
       const selfLabel = formatTargetLabel(target);
@@ -299,6 +308,9 @@ export async function runAgentDiscussion(
       history: opts.history,
       targetAgent: synthTarget.agent,
       config: opts.config,
+      sessionSummary: opts.sessionSummary,
+      summarizedUpTo: opts.summarizedUpTo,
+      transcriptPath: opts.transcriptPath,
     });
 
     const synthPrompt = buildSynthesisPrompt({

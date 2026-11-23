@@ -25,20 +25,37 @@ function buildApiMessages(
   history: ChatMessage[],
   rawUserPrompt: string,
   cwd: string,
+  sessionSummary?: string,
+  summarizedUpTo?: number,
 ): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+  const systemParts = [
+    `You are DeepSeek participating in a unified multi-agent terminal chat (mcli). Current working directory: ${cwd}. Be concise, accurate, and directly continue from any prior turns in the shared conversation.`,
+  ];
+  if (sessionSummary && sessionSummary.trim()) {
+    systemParts.push(`\nEarlier conversation summary:\n${sessionSummary.trim()}`);
+  }
+
   const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
     {
       role: "system",
-      content: `You are DeepSeek participating in a unified multi-agent terminal chat (mcli). Current working directory: ${cwd}. Be concise, accurate, and directly continue from any prior turns in the shared conversation.`,
+      content: systemParts.join("\n"),
     },
   ];
 
-  for (const msg of history.slice(-24)) {
+  const start = Math.max(0, Math.min(summarizedUpTo ?? 0, history.length));
+  const recent = history.slice(start).slice(-24);
+
+  for (const msg of recent) {
     if (msg.role === "user" && msg.content.trim()) {
       messages.push({ role: "user", content: msg.content });
     } else if (msg.role === "assistant" && msg.content.trim()) {
+      const label = msg.agent ? AGENT_META[msg.agent].label : "Agent";
+      const mod = msg.model ? `/${msg.model}` : "";
+      const round = msg.roundLabel ? ` · ${msg.roundLabel}` : "";
       const prefix =
-        msg.agent && msg.agent !== "deepseek" ? `[${AGENT_META[msg.agent].label}]: ` : "";
+        msg.agent && (msg.agent !== "deepseek" || msg.roundLabel)
+          ? `[${label}${mod}${round}]: `
+          : "";
       messages.push({ role: "assistant", content: prefix + msg.content });
     }
   }
@@ -60,7 +77,13 @@ async function runDeepSeekApi(opts: RunAgentOptions, apiKey: string): Promise<Ag
   let error: string | undefined;
   let aborted = false;
 
-  const messages = buildApiMessages(opts.history, opts.rawUserPrompt, opts.cwd);
+  const messages = buildApiMessages(
+    opts.history,
+    opts.rawUserPrompt,
+    opts.cwd,
+    opts.sessionSummary,
+    opts.summarizedUpTo,
+  );
 
   try {
     const response = await fetch(endpoint, {
