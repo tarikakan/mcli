@@ -5,11 +5,16 @@ import { detectAllAgents, getAdapter } from "../adapters/index.ts";
 import { isAgentId, parseInlineInput } from "../cli-args.ts";
 import { getConfigPath, saveConfig } from "../config.ts";
 import { runAgentDiscussion } from "../discussion.ts";
+import {
+  getEffectiveContextConfig,
+  resolveMemoryScribe,
+  runMemoryScribe,
+  shouldAutoCompact,
+} from "../memory-agent.ts";
 import { discoverAllAgentModels, discoverModelsForAgent, resolveModelAlias } from "../models.ts";
 import {
   buildPromptWithContext,
   buildSharedContextBlock,
-  compactSession,
   createMessageId,
   exportSessionMarkdown,
   getSessionTranscriptPath,
@@ -156,9 +161,14 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   };
   process.on("SIGINT", onSigInt);
 
-  const effectiveConfig = opts.noContext
-    ? { ...opts.config, shareContext: false }
-    : opts.config;
+  const effectiveLimits = getEffectiveContextConfig(
+    opts.config,
+    opts.noContext ? false : opts.config.shareContext,
+  );
+  const effectiveConfig: McliConfig = {
+    ...opts.config,
+    ...effectiveLimits,
+  };
 
   const targets = normalizeTargets(opts);
   const historySnapshot = [...opts.session.messages];
@@ -327,6 +337,24 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
       opts.session.messages.push(userMsg, ...assistantMessages);
       opts.session.activeAgent = targets[targets.length - 1]?.agent ?? opts.session.activeAgent;
       saveSession(opts.session);
+
+      if (!controller.signal.aborted && shouldAutoCompact(opts.session, opts.config)) {
+        const res = await runMemoryScribe({
+          session: opts.session,
+          cwd: opts.cwd,
+          config: opts.config,
+          signal: controller.signal,
+        });
+        if (isTty && res.compactedTurns > 0) {
+          process.stderr.write(
+            style(
+              `  ✎ Memory Scribe (${res.scribeLabel}) compacted ${res.compactedTurns} turn(s) — saved ~${res.estimatedTokensSaved.toLocaleString()} tokens/turn\n`,
+              DIM,
+              FG.cyan,
+            ),
+          );
+        }
+      }
     }
   } finally {
     process.off("SIGINT", onSigInt);
@@ -439,20 +467,65 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
         console.log(style("Cleared conversation history and rolling summary.", FG.green));
       } else if (cmd === "compact") {
         const fast = args.trim().toLowerCase() === "fast";
-        console.log(style(fast ? "Compacting older turns locally…" : `Compacting older turns with --${activeAgent}…`, DIM));
-        const res = await compactSession({
+        const scribe = fast
+          ? { label: "local digest ($0)" }
+          : resolveMemoryScribe(opts.config);
+        console.log(style(`Compacting older turns with Memory Scribe: ${scribe.label}…`, DIM));
+        const res = await runMemoryScribe({
           session: opts.session,
           cwd: opts.cwd,
-          keepRecentTurns: 2,
-          fast,
-          adapter: fast ? undefined : getAdapter(activeAgent),
-          agentConfig: opts.config.agents[activeAgent],
-          model: modelOverrides[activeAgent],
+          config: opts.config,
+          forceLocal: fast,
         });
         if (res.compactedTurns === 0) {
-          console.log(style("Nothing old enough to compact yet (keeping last 2 turns verbatim).", FG.yellow));
+          console.log(style("Nothing old enough to compact yet (recent turns stay verbatim).", FG.yellow));
         } else {
-          console.log(style(`Compacted ${res.compactedTurns} turn(s) into rolling summary (${res.mode}).`, FG.green));
+          console.log(
+            style(
+              `Compacted ${res.compactedTurns} turn(s) via ${res.scribeLabel} (saved ~${res.estimatedTokensSaved.toLocaleString()} tokens/turn).`,
+              FG.green,
+            ),
+          );
+        }
+      } else if (cmd === "memory") {
+        const parts = args.split(/\s+/).filter(Boolean);
+        const sub = (parts[0] || "status").toLowerCase();
+        if (sub === "status" || sub === "show") {
+          const scribe = resolveMemoryScribe(opts.config);
+          console.log(
+            [
+              style("\nMemory Scribe Agent:", BOLD),
+              `  Assigned Scribe: ${scribe.label}`,
+              `  Mode: ${opts.config.memory.mode}  |  Auto-compact: ${opts.config.memory.autoCompact ? "ON" : "OFF"}`,
+              `  Use /memory set <claude:haiku|deepseek:chat|auto|local>, /memory mode <lean|balanced|full>, /memory auto <on|off>\n`,
+            ].join("\n"),
+          );
+        } else if (sub === "set" && parts[1]) {
+          const cleaned = parts[1].replace(/^(--|@)/, "").toLowerCase();
+          if (cleaned === "auto" || cleaned === "local") {
+            opts.config.memory.agent = cleaned;
+            opts.config.memory.model = undefined;
+            saveConfig(opts.config);
+            console.log(style(`Memory Scribe set to ${resolveMemoryScribe(opts.config).label}.`, FG.green));
+          } else {
+            const parsedTarget = parseInlineInput(
+              parts.slice(1).join(" ").startsWith("--") ? parts.slice(1).join(" ") : `--${parts.slice(1).join(" ")}`,
+            ).targets[0];
+            if (parsedTarget) {
+              opts.config.memory.agent = parsedTarget.agent;
+              opts.config.memory.model = parsedTarget.model;
+              saveConfig(opts.config);
+              console.log(style(`Memory Scribe set to ${resolveMemoryScribe(opts.config).label}.`, FG.green));
+            }
+          }
+        } else if (sub === "mode" && (parts[1] === "lean" || parts[1] === "balanced" || parts[1] === "full")) {
+          opts.config.memory.mode = parts[1];
+          saveConfig(opts.config);
+          console.log(style(`Memory mode set to "${parts[1]}".`, FG.green));
+        } else if (sub === "auto") {
+          opts.config.memory.autoCompact = parts[1] === "on" ? true : parts[1] === "off" ? false : !opts.config.memory.autoCompact;
+          saveConfig(opts.config);
+          console.log(style(`Auto-compact: ${opts.config.memory.autoCompact ? "ON" : "OFF"}.`, FG.green));
         }
       } else if (cmd === "context") {
         if (args === "on") {

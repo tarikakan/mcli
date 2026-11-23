@@ -5,6 +5,12 @@ import { isAgentId, parseInlineInput } from "../cli-args.ts";
 import { getConfigPath, saveConfig } from "../config.ts";
 import { runAgentDiscussion } from "../discussion.ts";
 import {
+  getEffectiveContextConfig,
+  resolveMemoryScribe,
+  runMemoryScribe,
+  shouldAutoCompact,
+} from "../memory-agent.ts";
+import {
   discoverAllAgentModels,
   discoverModelsForAgent,
   getModelsForAgent,
@@ -61,6 +67,7 @@ const SLASH_COMMANDS = [
   "/agents",
   "/clear",
   "/compact",
+  "/memory",
   "/history",
   "/context",
   "/discuss",
@@ -170,6 +177,7 @@ export class UnifiedChatTui {
   private noticeExpiresAt = 0;
   private lastCtrlCAt = 0;
   private mouseEnabled = true;
+  private memoryCompacting = false;
   private modelPicker: ModelPickerState | null = null;
   private renderScheduled = false;
   private running = false;
@@ -980,8 +988,9 @@ export class UnifiedChatTui {
             "- `/model` or `--models` — open model picker or list models across all 5 CLIs",
             "- `/model <name>` — set model for active agent (or `/model <agent> <name>`, `/model default`, `/model save`)",
             "- `/status` — detect all 5 CLIs & API fallback status",
-            "- `/compact [fast]` — compress older turns into rolling shared memory (keeps last 2 turns verbatim)",
-            "- `/context [on|off|show]` — toggle or inspect shared memory & token usage sent to agents",
+            "- `/memory [status|set <agent[:model]|auto|local>|mode lean|balanced|full|auto on|off]` — assign a cheap/fast Scribe agent to manage memory and save tokens",
+            "- `/compact [fast]` — compress older turns via your Memory Scribe agent (keeps recent turns verbatim)",
+            "- `/context [on|off|show]` — toggle or inspect 3-tier shared memory & token usage sent to agents",
             "- `/clear` — reset shared conversation history and summary",
             "- `/mouse [on|off]` — toggle mouse wheel scrolling vs native text selection",
             "- `/session [list|save <name>|load <name>|new <name>]` — manage persistent sessions",
@@ -1019,39 +1028,121 @@ export class UnifiedChatTui {
         return;
 
       case "compact": {
-        if (this.activeController) {
-          this.setNotice("Wait for active generation to finish before compacting.");
+        if (this.activeController || this.memoryCompacting) {
+          this.setNotice("Wait for active generation/compaction to finish first.");
           return;
         }
         const fast = args.trim().toLowerCase() === "fast";
-        this.setNotice(
-          fast
-            ? "Compacting older turns into rolling summary…"
-            : `Compacting older turns using --${this.activeAgent}…`,
-          6000,
-        );
-        void compactSession({
+        const scribe = fast
+          ? { label: "local digest ($0)" }
+          : resolveMemoryScribe(this.config, this.availability);
+        this.memoryCompacting = true;
+        this.setNotice(`Compacting older turns with Memory Scribe: ${scribe.label}…`, 6000);
+        void runMemoryScribe({
           session: this.session,
           cwd: this.cwd,
-          keepRecentTurns: 2,
-          fast,
-          adapter: fast ? undefined : getAdapter(this.activeAgent),
-          agentConfig: this.config.agents[this.activeAgent],
-          model: this.modelOverrides[this.activeAgent],
-        }).then((res) => {
-          if (res.compactedTurns === 0) {
-            this.setNotice("Not enough older turns to compact yet (last 2 turns stay verbatim).");
-          } else {
-            this.addSystemMessage(
-              [
-                `**Compacted ${res.compactedTurns} earlier turn(s) into rolling shared memory (${res.mode}):**`,
-                "",
-                res.summary,
-              ].join("\n"),
-            );
-            this.setNotice(`Rolling summary saved (${res.compactedTurns} turns compacted).`);
+          config: this.config,
+          availability: this.availability,
+          forceLocal: fast,
+        })
+          .then((res) => {
+            if (res.compactedTurns === 0) {
+              this.setNotice("Not enough older turns to compact yet (recent turns stay verbatim).");
+            } else {
+              this.addSystemMessage(
+                [
+                  `**Memory Scribe (${res.scribeLabel}) compacted ${res.compactedTurns} turn(s) — saved ~${res.estimatedTokensSaved.toLocaleString()} tokens/turn:**`,
+                  "",
+                  res.summary,
+                ].join("\n"),
+              );
+              this.setNotice(`Memory compacted by ${res.scribeLabel} (saved ~${res.estimatedTokensSaved} tokens).`);
+            }
+          })
+          .finally(() => {
+            this.memoryCompacting = false;
+          });
+        return;
+      }
+
+      case "memory": {
+        const parts = args.split(/\s+/).filter(Boolean);
+        const sub = (parts[0] || "status").toLowerCase();
+
+        if (sub === "status" || sub === "show") {
+          const scribe = resolveMemoryScribe(this.config, this.availability);
+          const eff = getEffectiveContextConfig(this.config, this.shareContext);
+          const { stats } = buildSharedContextBlock({
+            history: this.session.messages,
+            targetAgent: this.activeAgent,
+            config: eff,
+            sessionSummary: this.session.summary,
+            summarizedUpTo: this.session.summarizedUpTo,
+            transcriptPath: getSessionTranscriptPath(this.session.id),
+          });
+          this.addSystemMessage(
+            [
+              "**Memory Scribe Agent (Token Saver)**",
+              "",
+              `- **Assigned Scribe:** ${scribe.label} (config: \`${this.config.memory.agent}${this.config.memory.model ? `:${this.config.memory.model}` : ""}\`)`,
+              `- **Memory Mode:** \`${this.config.memory.mode}\` (window cap: ${eff.maxContextChars.toLocaleString()} chars / ${eff.maxContextTurns} turns)`,
+              `- **Auto-Compact:** ${this.config.memory.autoCompact ? `ON (threshold: ${this.config.memory.autoCompactThresholdChars.toLocaleString()} chars)` : "OFF"}`,
+              `- **Current Context Sent to Next Agent:** ~${stats.estimatedTokens.toLocaleString()} tokens (${stats.contextChars.toLocaleString()} chars)`,
+              "",
+              "**Commands:**",
+              "- `/memory set claude:haiku` or `/memory set deepseek:chat` or `/memory set agy:gemini-2.5-flash` or `/memory set codex:o4-mini`",
+              "- `/memory set local` (zero tokens / $0 instant local digest) or `/memory set auto`",
+              "- `/memory mode lean` (summary + last 1 turn — minimum tokens) | `balanced` | `full`",
+              "- `/memory auto on|off`",
+            ].join("\n"),
+          );
+          return;
+        }
+
+        if (sub === "set" && parts[1]) {
+          const rawArg = parts.slice(1).join(" ").trim();
+          const cleanedFirst = parts[1].replace(/^(--|@)/, "").toLowerCase();
+          if (cleanedFirst === "auto" || cleanedFirst === "local") {
+            this.config.memory.agent = cleanedFirst;
+            this.config.memory.model = undefined;
+            saveConfig(this.config);
+            const scribe = resolveMemoryScribe(this.config, this.availability);
+            this.setNotice(`Memory Scribe set to ${scribe.label} (saved to ~/.mcli/config.json).`);
+            return;
           }
-        });
+          const inlineParsed = parseInlineInput(
+            rawArg.startsWith("--") || rawArg.startsWith("@") ? rawArg : `--${rawArg}`,
+          );
+          const picked = inlineParsed.targets[0];
+          if (picked) {
+            this.config.memory.agent = picked.agent;
+            this.config.memory.model =
+              picked.model ?? (parts[2] ? resolveModelAlias(picked.agent, parts[2].replace(/^--/, "")) : undefined);
+            saveConfig(this.config);
+            const scribe = resolveMemoryScribe(this.config, this.availability);
+            this.setNotice(`Memory Scribe set to ${scribe.label} (saved to ~/.mcli/config.json).`);
+            return;
+          }
+          this.setNotice("Usage: /memory set <claude:haiku | deepseek:chat | agy:gemini-2.5-flash | codex:o4-mini | auto | local>");
+          return;
+        }
+
+        if (sub === "mode" && (parts[1] === "lean" || parts[1] === "balanced" || parts[1] === "full")) {
+          this.config.memory.mode = parts[1];
+          saveConfig(this.config);
+          this.setNotice(`Memory mode set to "${parts[1]}" (saved to ~/.mcli/config.json).`);
+          return;
+        }
+
+        if (sub === "auto") {
+          const next = parts[1] === "on" ? true : parts[1] === "off" ? false : !this.config.memory.autoCompact;
+          this.config.memory.autoCompact = next;
+          saveConfig(this.config);
+          this.setNotice(`Auto-compaction via Memory Scribe: ${next ? "ON" : "OFF"} (saved).`);
+          return;
+        }
+
+        this.setNotice("Usage: /memory [status | set <agent[:model]|auto|local> | mode lean|balanced|full | auto on|off]");
         return;
       }
 
@@ -1080,10 +1171,12 @@ export class UnifiedChatTui {
           this.setNotice("Shared cross-agent context is now OFF.");
         } else if (args === "show" || args === "status") {
           const transcriptPath = getSessionTranscriptPath(this.session.id);
+          const eff = getEffectiveContextConfig(this.config, this.shareContext);
+          const scribe = resolveMemoryScribe(this.config, this.availability);
           const { contextBlock, stats } = buildSharedContextBlock({
             history: this.session.messages,
             targetAgent: this.activeAgent,
-            config: { ...this.config, shareContext: this.shareContext },
+            config: eff,
             sessionSummary: this.session.summary,
             summarizedUpTo: this.session.summarizedUpTo,
             transcriptPath,
@@ -1091,8 +1184,8 @@ export class UnifiedChatTui {
           const lines = [
             `**Shared Conversation Memory (3-Tier)**`,
             "",
-            `- **Status:** ${this.shareContext ? "ON" : "OFF"} (next target: \`--${this.activeAgent}\`)`,
-            `- **Tier 1 (Rolling Summary):** ${this.session.summary ? `active (${this.session.summarizedUpTo ?? 0} msgs compacted)` : "none yet — run \`/compact\` to summarize older turns"}`,
+            `- **Status:** ${this.shareContext ? "ON" : "OFF"} · mode: \`${this.config.memory.mode}\` · scribe: **${scribe.label}**`,
+            `- **Tier 1 (Rolling Summary):** ${this.session.summary ? `active (${this.session.summarizedUpTo ?? 0} msgs compacted)` : "none yet — auto-compacts or run \`/compact\`"}`,
             `- **Tier 2 (Active Window):** ${stats.includedTurns} turn(s) · ~${stats.estimatedTokens} tokens (${stats.contextChars} chars) · ${stats.foldedDiscussions} older discussion(s) folded · ${stats.overflowDigestedTurns} overflow turn(s) auto-digested`,
             `- **Tier 3 (Full Transcript File):** \`${transcriptPath}\``,
           ];
@@ -1313,9 +1406,10 @@ export class UnifiedChatTui {
       this.scheduleRender();
     }, 90);
 
+    const effectiveLimits = getEffectiveContextConfig(this.config, this.shareContext);
     const effectiveConfig: McliConfig = {
       ...this.config,
-      shareContext: this.shareContext,
+      ...effectiveLimits,
       agentDiscussion: this.agentDiscussion,
       discussionRounds: discussionOpts.rounds,
     };
@@ -1493,7 +1587,37 @@ export class UnifiedChatTui {
       this.activeController = null;
       this.liveStreams = [];
       this.scheduleRender();
+      this.maybeTriggerBackgroundMemoryScribe();
     }
+  }
+
+  private maybeTriggerBackgroundMemoryScribe(): void {
+    if (this.memoryCompacting || !shouldAutoCompact(this.session, this.config)) {
+      return;
+    }
+    const targetSession = this.session;
+    const expectedId = targetSession.id;
+    const scribe = resolveMemoryScribe(this.config, this.availability);
+    this.memoryCompacting = true;
+    this.setNotice(`✎ Memory Scribe (${scribe.label}) compacting older turns in background…`, 4000);
+
+    void runMemoryScribe({
+      session: targetSession,
+      cwd: this.cwd,
+      config: this.config,
+      availability: this.availability,
+    })
+      .then((res) => {
+        if (this.session.id === expectedId && res.compactedTurns > 0) {
+          this.setNotice(
+            `✎ Memory updated by ${res.scribeLabel} · compacted ${res.compactedTurns} turn(s), saved ~${res.estimatedTokensSaved.toLocaleString()} tokens/turn`,
+            4500,
+          );
+        }
+      })
+      .finally(() => {
+        this.memoryCompacting = false;
+      });
   }
 
   private buildHeaderLines(cols: number): string[] {

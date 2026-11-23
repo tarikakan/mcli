@@ -77,6 +77,21 @@ export interface AgentConfig {
   baseUrl?: string;
 }
 
+export type MemoryMode = "lean" | "balanced" | "full";
+
+export interface MemoryConfig {
+  /** Agent in charge of summarizing/compacting shared memory ("auto" picks cheapest available, "local" = 0 tokens) */
+  agent: AgentId | "auto" | "local";
+  /** Optional explicit model for the memory agent (defaults to fast/cheap tier like haiku / deepseek-chat / o4-mini) */
+  model?: string;
+  /** Automatically compact older turns in the background after turns cross threshold */
+  autoCompact: boolean;
+  /** Controls how much verbatim history is sent alongside the rolling summary */
+  mode: MemoryMode;
+  /** Unsummarized character threshold before auto-compaction triggers */
+  autoCompactThresholdChars: number;
+}
+
 export interface McliConfig {
   defaultAgent: AgentId;
   shareContext: boolean;
@@ -84,6 +99,7 @@ export interface McliConfig {
   maxContextChars: number;
   agentDiscussion: boolean;
   discussionRounds: number;
+  memory: MemoryConfig;
   agents: Record<AgentId, AgentConfig>;
 }
 

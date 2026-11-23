@@ -24,6 +24,12 @@ export function createDefaultConfig(): McliConfig {
     maxContextChars: 24000,
     agentDiscussion: false,
     discussionRounds: 2,
+    memory: {
+      agent: "auto",
+      autoCompact: true,
+      mode: "balanced",
+      autoCompactThresholdChars: 6000,
+    },
     agents: {
       claude: {
         enabled: true,
@@ -103,6 +109,30 @@ export function loadConfig(): McliConfig {
         typeof parsed.discussionRounds === "number" && parsed.discussionRounds >= 1
           ? Math.min(6, Math.floor(parsed.discussionRounds))
           : defaults.discussionRounds,
+      memory: {
+        agent:
+          parsed.memory?.agent === "auto" ||
+          parsed.memory?.agent === "local" ||
+          (parsed.memory?.agent && AGENT_IDS.includes(parsed.memory.agent))
+            ? parsed.memory.agent
+            : defaults.memory.agent,
+        model: typeof parsed.memory?.model === "string" ? parsed.memory.model : defaults.memory.model,
+        autoCompact:
+          typeof parsed.memory?.autoCompact === "boolean"
+            ? parsed.memory.autoCompact
+            : defaults.memory.autoCompact,
+        mode:
+          parsed.memory?.mode === "lean" ||
+          parsed.memory?.mode === "balanced" ||
+          parsed.memory?.mode === "full"
+            ? parsed.memory.mode
+            : defaults.memory.mode,
+        autoCompactThresholdChars:
+          typeof parsed.memory?.autoCompactThresholdChars === "number" &&
+          parsed.memory.autoCompactThresholdChars >= 1000
+            ? parsed.memory.autoCompactThresholdChars
+            : defaults.memory.autoCompactThresholdChars,
+      },
       agents: mergedAgents,
     };
   } catch {
