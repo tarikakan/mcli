@@ -32,7 +32,8 @@ const DEFAULT_PRESETS: Record<AgentId, Array<{ id: string; note: string }>> = {
     { id: "best", note: "Highest-tier reasoning model on your account" },
   ],
   codex: [
-    { id: "gpt-5.3-codex", note: "Latest Codex agentic coding model" },
+    { id: "gpt-5.6-sol", note: "GPT-5.6 Sol flagship reasoning & coding" },
+    { id: "gpt-5.3-codex", note: "Codex agentic coding model" },
     { id: "gpt-5.2-codex", note: "GPT-5.2 Codex" },
     { id: "gpt-5.1-codex", note: "GPT-5.1 Codex" },
     { id: "o3", note: "OpenAI o3 reasoning model" },

@@ -48,6 +48,20 @@ export const AGENT_META: Record<AgentId, AgentMeta> = {
   },
 };
 
+export interface AgentTarget {
+  agent: AgentId;
+  model?: string;
+}
+
+export function formatTargetLabel(target: AgentTarget): string {
+  const base = AGENT_META[target.agent].label;
+  return target.model ? `${base} (${target.model})` : base;
+}
+
+export function targetKey(target: AgentTarget): string {
+  return `${target.agent}:${target.model ?? ""}`;
+}
+
 export interface AgentConfig {
   enabled?: boolean;
   command?: string;
@@ -68,6 +82,8 @@ export interface McliConfig {
   shareContext: boolean;
   maxContextTurns: number;
   maxContextChars: number;
+  agentDiscussion: boolean;
+  discussionRounds: number;
   agents: Record<AgentId, AgentConfig>;
 }
 
@@ -81,6 +97,7 @@ export interface ChatMessage {
   role: "user" | "assistant" | "system";
   agent?: AgentId;
   model?: string;
+  roundLabel?: string;
   content: string;
   reasoning?: string;
   tools?: ToolEvent[];

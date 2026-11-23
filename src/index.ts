@@ -4,7 +4,7 @@ import { createDefaultConfig, getConfigPath, loadConfig, saveConfig } from "./co
 import { resolveModelAlias } from "./models.ts";
 import { loadOrCreateSession } from "./session.ts";
 import { AGENT_IDS } from "./types.ts";
-import type { AgentId } from "./types.ts";
+import type { AgentId, AgentTarget } from "./types.ts";
 import { BOLD, DIM, FG, style } from "./ui/ansi.ts";
 import { formatDoctorReport, formatModelsReport, runOneShot, runPlainRepl } from "./ui/plain-repl.ts";
 import { UnifiedChatTui } from "./ui/tui.ts";
@@ -29,14 +29,18 @@ function printHelp(): void {
     style("Examples:", BOLD),
     "  mcli                                       Open unified chat TUI",
     "  mcli --codex                               Open TUI starting on Codex",
-    '  mcli --claude:opus "explain src/index.ts"  Pick model inline with --agent:model',
-    '  mcli --codex -m o3 "write tests for it"    Follow up with Codex using shared context',
-    '  mcli --claude:opus --deepseek:reasoner "compare ideas"  Parallel multi-agent + models',
+    '  mcli --claude --opus "explain src/index.ts"  Pick firm + model with --agent --<model>',
+    '  mcli --codex --gpt-5.6-sol --claude --opus --agent discussion "investigate heavy quarks"',
+    '  mcli --claude:opus --deepseek:reasoner --discuss "compare designs"',
     '  git diff | mcli --agy "review this diff"   Pipe stdin directly to any agent',
     "",
     style("Options:", BOLD),
     "  -m, --model <name>     Override model for the active/selected agent",
     "  --models               List available & preset models for all (or selected) agents",
+    "  --discuss, --agent discussion  Enable multi-round peer discussion + synthesis across 2+ agents",
+    "  --rounds <N>           Number of discussion rounds (default: 2, max: 6)",
+    "  --no-synthesis         Skip final consensus synthesis step after discussion rounds",
+    "  --no-discuss           Force parallel-only mode even if discussion is enabled in config",
     "  -s, --session <name>   Load or create a named shared session",
     "  --new                  Start a fresh session (do not load previous workspace history)",
     "  --no-context           Disable cross-agent context injection for this run",
@@ -119,7 +123,21 @@ export async function main(argv: string[]): Promise<void> {
     .join("")
     .trim();
 
-  // Merge global --model with per-agent --agent:model overrides
+  // Build concrete targets preserving multi-firm and same-firm multi-model selections
+  const resolvedTargets: AgentTarget[] =
+    args.targets.length > 0
+      ? args.targets.map((t) => ({
+          agent: t.agent,
+          model: t.model ?? (args.model ? resolveModelAlias(t.agent, args.model) : undefined),
+        }))
+      : [
+          {
+            agent: initialAgent,
+            model: args.model ? resolveModelAlias(initialAgent, args.model) : undefined,
+          },
+        ];
+
+  // Merge global --model with per-agent --agent:model overrides for interactive startup
   const initialAgentModels: Partial<Record<AgentId, string>> = { ...args.agentModels };
   if (args.model) {
     const targets = args.agents.length > 0 ? args.agents : [initialAgent];
@@ -132,15 +150,18 @@ export async function main(argv: string[]): Promise<void> {
 
   // One-shot mode if user passed a prompt or piped stdin
   if (combinedPrompt.length > 0) {
-    const targetAgents = args.agents.length > 0 ? args.agents : [initialAgent];
     const exitCode = await runOneShot({
-      agents: targetAgents,
+      agents: resolvedTargets.map((t) => t.agent),
+      targets: resolvedTargets,
       prompt: combinedPrompt,
       config,
       session,
       cwd,
       modelOverride: args.model,
       agentModels: initialAgentModels,
+      discuss: args.discuss,
+      discussionRounds: args.discussionRounds,
+      synthesize: !args.noSynthesis,
       noContext: args.noContext,
       saveToSession: true,
     });
@@ -157,6 +178,8 @@ export async function main(argv: string[]): Promise<void> {
       initialAgent,
       modelOverride: args.model,
       agentModels: initialAgentModels,
+      agentDiscussion: args.discuss,
+      discussionRounds: args.discussionRounds,
     });
     return;
   }
@@ -168,6 +191,8 @@ export async function main(argv: string[]): Promise<void> {
     initialAgent,
     modelOverride: args.model,
     agentModels: initialAgentModels,
+    agentDiscussion: args.discuss,
+    discussionRounds: args.discussionRounds,
   });
   await tui.start();
 }

@@ -22,6 +22,8 @@ export function createDefaultConfig(): McliConfig {
     shareContext: true,
     maxContextTurns: 12,
     maxContextChars: 24000,
+    agentDiscussion: false,
+    discussionRounds: 2,
     agents: {
       claude: {
         enabled: true,
@@ -93,6 +95,14 @@ export function loadConfig(): McliConfig {
         typeof parsed.maxContextChars === "number" && parsed.maxContextChars > 0
           ? parsed.maxContextChars
           : defaults.maxContextChars,
+      agentDiscussion:
+        typeof parsed.agentDiscussion === "boolean"
+          ? parsed.agentDiscussion
+          : defaults.agentDiscussion,
+      discussionRounds:
+        typeof parsed.discussionRounds === "number" && parsed.discussionRounds >= 1
+          ? Math.min(6, Math.floor(parsed.discussionRounds))
+          : defaults.discussionRounds,
       agents: mergedAgents,
     };
   } catch {

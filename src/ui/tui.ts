@@ -3,6 +3,7 @@ import path from "node:path";
 import { detectAllAgents, getAdapter } from "../adapters/index.ts";
 import { isAgentId, parseInlineInput } from "../cli-args.ts";
 import { getConfigPath, saveConfig } from "../config.ts";
+import { runAgentDiscussion } from "../discussion.ts";
 import {
   discoverAllAgentModels,
   discoverModelsForAgent,
@@ -18,10 +19,11 @@ import {
   loadOrCreateSession,
   saveSession,
 } from "../session.ts";
-import { AGENT_IDS, AGENT_META } from "../types.ts";
+import { AGENT_IDS, AGENT_META, formatTargetLabel } from "../types.ts";
 import type {
   AgentAvailability,
   AgentId,
+  AgentTarget,
   ChatMessage,
   McliConfig,
   SessionData,
@@ -56,6 +58,7 @@ const SLASH_COMMANDS = [
   "/clear",
   "/history",
   "/context",
+  "/discuss",
   "/model",
   "/models",
   "/mouse",
@@ -106,6 +109,7 @@ export function parseMouseSequence(rest: string): ParsedMouseSequence | undefine
 interface LiveStream {
   agent: AgentId;
   model?: string;
+  roundLabel?: string;
   text: string;
   reasoning: string;
   tools: ToolEvent[];
@@ -121,6 +125,8 @@ export interface TuiOptions {
   initialAgent: AgentId;
   modelOverride?: string;
   agentModels?: Partial<Record<AgentId, string>>;
+  agentDiscussion?: boolean;
+  discussionRounds?: number;
 }
 
 interface ModelPickerState {
@@ -137,6 +143,8 @@ export class UnifiedChatTui {
   private availability: Record<AgentId, AgentAvailability>;
   private modelOverrides: Partial<Record<AgentId, string>> = {};
   private shareContext: boolean;
+  private agentDiscussion: boolean;
+  private discussionRounds: number;
 
   private input = "";
   private cursor = 0;
@@ -168,6 +176,8 @@ export class UnifiedChatTui {
     this.cwd = opts.cwd;
     this.activeAgent = opts.initialAgent;
     this.shareContext = opts.config.shareContext;
+    this.agentDiscussion = opts.agentDiscussion ?? opts.config.agentDiscussion;
+    this.discussionRounds = opts.discussionRounds ?? opts.config.discussionRounds;
     this.availability = detectAllAgents(opts.config);
     if (opts.agentModels) {
       this.modelOverrides = { ...opts.agentModels };
@@ -321,7 +331,10 @@ export class UnifiedChatTui {
       const prefix = tokenMatch[1];
       const lead = prefix.startsWith("--") ? "--" : "@";
       const partial = prefix.slice(lead.length).toLowerCase();
-      const candidates = lead === "--" ? [...AGENT_IDS, "models", "model"] : [...AGENT_IDS];
+      const candidates =
+        lead === "--"
+          ? [...AGENT_IDS, "models", "model", "discuss", "agent-discussion", "rounds"]
+          : [...AGENT_IDS];
       const matched = candidates.find((id) => id.startsWith(partial) && id !== partial);
       if (matched) {
         return beforeCursor.slice(0, beforeCursor.length - prefix.length) + lead + matched + " ";
@@ -887,24 +900,46 @@ export class UnifiedChatTui {
     }
 
     this.promptHistory.push(trimmed);
-    const targets: AgentId[] = parsed.agents.length > 0 ? parsed.agents : [this.activeAgent];
+    const targets: AgentTarget[] =
+      parsed.targets.length > 0
+        ? parsed.targets.map((t) => ({
+            agent: t.agent,
+            model:
+              t.model ??
+              (parsed.modelOverride ? resolveModelAlias(t.agent, parsed.modelOverride) : undefined) ??
+              this.modelOverrides[t.agent],
+          }))
+        : [
+            {
+              agent: this.activeAgent,
+              model:
+                (parsed.modelOverride
+                  ? resolveModelAlias(this.activeAgent, parsed.modelOverride)
+                  : undefined) ?? this.modelOverrides[this.activeAgent],
+            },
+          ];
 
     // If user routed with a single --agent flag, also make it the active agent for follow-ups
-    if (parsed.agents.length === 1) {
-      this.activeAgent = parsed.agents[0];
+    if (targets.length === 1 && parsed.targets.length === 1) {
+      this.activeAgent = targets[0].agent;
       this.session.activeAgent = this.activeAgent;
     }
 
-    const turnModels: Partial<Record<AgentId, string>> = {};
-    for (const ag of targets) {
-      const m =
-        parsed.agentModels[ag] ??
-        (parsed.modelOverride ? resolveModelAlias(ag, parsed.modelOverride) : undefined) ??
-        this.modelOverrides[ag];
-      if (m) turnModels[ag] = m;
+    const useDiscuss = parsed.discuss ?? this.agentDiscussion;
+    const rounds = parsed.discussionRounds ?? this.discussionRounds;
+
+    if (useDiscuss && targets.length < 2) {
+      this.setNotice(
+        "Agent discussion needs 2+ agents/models (e.g. --codex --gpt-5.6-sol --claude --opus). Running single agent.",
+        4000,
+      );
     }
 
-    await this.dispatchAgents(targets, parsed.prompt, turnModels);
+    await this.dispatchTargets(targets, parsed.prompt, {
+      discuss: useDiscuss && targets.length >= 2,
+      rounds,
+      synthesize: !parsed.noSynthesis,
+    });
   }
 
   private handleSlashCommand(cmd: string, args: string): void {
@@ -922,9 +957,10 @@ export class UnifiedChatTui {
             "",
             "**Switch or route inline with flags:**",
             "- `--claude <prompt>` / `--codex <prompt>` / `--agy <prompt>` / `--deepseek <prompt>` / `--kimi <prompt>`",
-            "- `--claude:opus <prompt>` or `--deepseek:reasoner <prompt>` — choose model inline per turn",
-            "- `--codex` or `--claude:opus` alone switches the active default agent / model",
-            "- `--claude:opus --codex:o3 <prompt>` runs multiple agents with specific models in parallel",
+            "- `--claude:opus <prompt>` or `--claude --opus <prompt>` — choose firm + model per turn",
+            "- `--codex --gpt-5.6-sol --claude --opus <prompt>` — run multiple firms & models on one job",
+            "- Add `--agent discussion` (or `--discuss`, `--rounds 3`) to let the models peer-review each other and synthesize consensus",
+            "- `--codex` or `--claude --opus` alone switches the active default agent / model",
             "- `@claude`, `@codex`, etc. also work as shortcuts",
             "",
             "**Shortcuts:**",
@@ -935,12 +971,13 @@ export class UnifiedChatTui {
             "- `Ctrl+C` / `Esc`: cancel active streaming response without quitting",
             "",
             "**Slash Commands:**",
-            "- `/model` or `/models` — open interactive model picker",
+            "- `/discuss [on|off|rounds <N>]` — toggle default multi-agent discussion mode",
+            "- `/model` or `--models` — open model picker or list models across all 5 CLIs",
             "- `/model <name>` — set model for active agent (or `/model <agent> <name>`, `/model default`, `/model save`)",
             "- `/status` — detect all 5 CLIs & API fallback status",
             "- `/clear` — reset shared conversation history",
             "- `/context [on|off]` — toggle cross-agent context sharing",
-            "- `/model <name|default>` — override model for active agent",
+            "- `/mouse [on|off]` — toggle mouse wheel scrolling vs native text selection",
             "- `/session [list|load <name>|new <name>]` — manage sessions",
             "- `/copy` — copy last assistant response to clipboard",
             "- `/export [file.md]` — export conversation to Markdown",
@@ -997,6 +1034,30 @@ export class UnifiedChatTui {
           `Shared cross-agent context is now ${this.shareContext ? "ON" : "OFF"} (max ${this.config.maxContextTurns} turns).`,
         );
         return;
+
+      case "discuss":
+      case "discussion": {
+        const parts = args.split(/\s+/).filter(Boolean);
+        if (parts[0] === "on") {
+          this.agentDiscussion = true;
+        } else if (parts[0] === "off") {
+          this.agentDiscussion = false;
+        } else if (parts[0] === "rounds" && parts[1]) {
+          const n = Number.parseInt(parts[1], 10);
+          if (Number.isFinite(n) && n >= 1) {
+            this.discussionRounds = Math.min(6, n);
+            this.agentDiscussion = true;
+          }
+        } else {
+          this.agentDiscussion = !this.agentDiscussion;
+        }
+        this.setNotice(
+          this.agentDiscussion
+            ? `Agent discussion ON by default (${this.discussionRounds} rounds + synthesis for 2+ models).`
+            : "Agent discussion OFF by default (add --discuss or --agent discussion on any multi-model prompt).",
+        );
+        return;
+      }
 
       case "mouse":
         if (args === "on") this.setMouseTracking(true);
@@ -1135,17 +1196,25 @@ export class UnifiedChatTui {
     }
   }
 
-  private async dispatchAgents(
-    agents: AgentId[],
+  private async dispatchTargets(
+    targets: AgentTarget[],
     userPrompt: string,
-    turnModels: Partial<Record<AgentId, string>> = {},
+    discussionOpts: { discuss: boolean; rounds: number; synthesize: boolean },
   ): Promise<void> {
     const historySnapshot = [...this.session.messages];
+
+    const targetListLabel =
+      targets.length > 1
+        ? targets.map((t) => formatTargetLabel(t)).join(discussionOpts.discuss ? " ↔ " : " + ")
+        : undefined;
 
     const userMsg: ChatMessage = {
       id: createMessageId(),
       role: "user",
-      agent: agents[0],
+      agent: targets[0]?.agent,
+      roundLabel: targetListLabel
+        ? `${targetListLabel}${discussionOpts.discuss ? ` · Discussion (${discussionOpts.rounds}r)` : ""}`
+        : undefined,
       content: userPrompt,
       timestamp: new Date().toISOString(),
     };
@@ -1154,91 +1223,175 @@ export class UnifiedChatTui {
 
     const controller = new AbortController();
     this.activeController = controller;
-    this.liveStreams = agents.map((agent) => ({
-      agent,
-      model: turnModels[agent] ?? this.modelOverrides[agent] ?? this.config.agents[agent]?.model,
-      text: "",
-      reasoning: "",
-      tools: [],
-      startedAt: Date.now(),
-      done: false,
-    }));
 
     this.spinnerTimer = setInterval(() => {
       this.spinnerIdx = (this.spinnerIdx + 1) % SPINNER_FRAMES.length;
       this.scheduleRender();
     }, 90);
 
-    this.scheduleRender();
-
-    const effectiveConfig = { ...this.config, shareContext: this.shareContext };
+    const effectiveConfig: McliConfig = {
+      ...this.config,
+      shareContext: this.shareContext,
+      agentDiscussion: this.agentDiscussion,
+      discussionRounds: discussionOpts.rounds,
+    };
 
     try {
-      const results = await Promise.all(
-        agents.map(async (agent, idx) => {
-          const stream = this.liveStreams[idx];
-          const adapter = getAdapter(agent);
-          const agentConfig = this.config.agents[agent] ?? {};
-          const effectiveModel = turnModels[agent] ?? this.modelOverrides[agent];
+      if (discussionOpts.discuss && targets.length >= 2) {
+        let roundCommittedCount = 0;
+        let currentRoundMessages: ChatMessage[] = [];
 
-          const fullPrompt = buildPromptWithContext({
-            userPrompt,
-            history: historySnapshot,
-            targetAgent: agent,
-            config: effectiveConfig,
-          });
-
-          const res = await adapter.run({
-            prompt: fullPrompt,
-            rawUserPrompt: userPrompt,
-            history: historySnapshot,
-            cwd: this.cwd,
-            model: effectiveModel,
-            sessionId: this.session.agentSessions[agent],
-            config: agentConfig,
-            signal: controller.signal,
-            onEvent: (ev) => {
-              if (ev.type === "text" && ev.text) {
-                stream.text += ev.text;
-              } else if (ev.type === "reasoning" && ev.text) {
-                stream.reasoning += ev.text;
-              } else if (ev.type === "tool" && ev.toolName) {
-                stream.tools.push({ name: ev.toolName, detail: ev.toolDetail });
-              } else if (ev.type === "error" && ev.text) {
-                stream.error = ev.text;
-              }
-              this.scheduleRender();
-            },
-          });
-
-          stream.done = true;
-          if (res.sessionId) {
-            this.session.agentSessions[agent] = res.sessionId;
+        const commitFinishedRound = (): void => {
+          if (currentRoundMessages.length > 0) {
+            this.session.messages.push(...currentRoundMessages);
+            roundCommittedCount += currentRoundMessages.length;
+            currentRoundMessages = [];
           }
-          this.scheduleRender();
+        };
 
-          return { agent, res, effectiveModel };
-        }),
-      );
-
-      for (const { agent, res, effectiveModel } of results) {
-        const agentConfig = this.config.agents[agent] ?? {};
-        this.session.messages.push({
-          id: createMessageId(),
-          role: "assistant",
-          agent,
-          model: effectiveModel ?? agentConfig.model,
-          content: res.text,
-          reasoning: res.reasoning || undefined,
-          tools: res.tools.length > 0 ? res.tools : undefined,
-          timestamp: new Date().toISOString(),
-          durationMs: res.durationMs,
-          error: res.error,
-          aborted: res.aborted,
+        const discResult = await runAgentDiscussion({
+          targets,
+          userPrompt,
+          history: historySnapshot,
+          cwd: this.cwd,
+          config: effectiveConfig,
+          rounds: discussionOpts.rounds,
+          synthesize: discussionOpts.synthesize,
+          signal: controller.signal,
+          parallel: true,
+          onRoundStart: ({ roundLabel, participants }) => {
+            commitFinishedRound();
+            this.liveStreams = participants.map((t) => ({
+              agent: t.agent,
+              model: t.model ?? this.config.agents[t.agent]?.model,
+              roundLabel,
+              text: "",
+              reasoning: "",
+              tools: [],
+              startedAt: Date.now(),
+              done: false,
+            }));
+            this.scheduleRender();
+          },
+          onParticipantEvent: ({ index, event }) => {
+            const stream = this.liveStreams[index];
+            if (!stream) return;
+            if (event.type === "text" && event.text) {
+              stream.text += event.text;
+            } else if (event.type === "reasoning" && event.text) {
+              stream.reasoning += event.text;
+            } else if (event.type === "tool" && event.toolName) {
+              stream.tools.push({ name: event.toolName, detail: event.toolDetail });
+            } else if (event.type === "error" && event.text) {
+              stream.error = event.text;
+            }
+            this.scheduleRender();
+          },
+          onParticipantDone: ({ index, target, roundLabel, result }) => {
+            const stream = this.liveStreams[index];
+            if (stream) stream.done = true;
+            const agentConfig = this.config.agents[target.agent] ?? {};
+            currentRoundMessages.push({
+              id: createMessageId(),
+              role: "assistant",
+              agent: target.agent,
+              model: target.model ?? agentConfig.model,
+              roundLabel,
+              content: result.text,
+              reasoning: result.reasoning || undefined,
+              tools: result.tools.length > 0 ? result.tools : undefined,
+              timestamp: new Date().toISOString(),
+              durationMs: result.durationMs,
+              error: result.error,
+              aborted: result.aborted,
+            });
+            this.scheduleRender();
+          },
         });
-      }
 
-      saveSession(this.session);
+        commitFinishedRound();
+        Object.assign(this.session.agentSessions, discResult.sessionIds);
+        if (roundCommittedCount === 0 && discResult.messages.length > 0) {
+          this.session.messages.push(...discResult.messages);
+        }
+        saveSession(this.session);
+      } else {
+        this.liveStreams = targets.map((t) => ({
+          agent: t.agent,
+          model: t.model ?? this.config.agents[t.agent]?.model,
+          text: "",
+          reasoning: "",
+          tools: [],
+          startedAt: Date.now(),
+          done: false,
+        }));
+        this.scheduleRender();
+
+        const results = await Promise.all(
+          targets.map(async (target, idx) => {
+            const stream = this.liveStreams[idx];
+            const adapter = getAdapter(target.agent);
+            const agentConfig = this.config.agents[target.agent] ?? {};
+
+            const fullPrompt = buildPromptWithContext({
+              userPrompt,
+              history: historySnapshot,
+              targetAgent: target.agent,
+              config: effectiveConfig,
+            });
+
+            const res = await adapter.run({
+              prompt: fullPrompt,
+              rawUserPrompt: userPrompt,
+              history: historySnapshot,
+              cwd: this.cwd,
+              model: target.model,
+              sessionId: this.session.agentSessions[target.agent],
+              config: agentConfig,
+              signal: controller.signal,
+              onEvent: (ev) => {
+                if (ev.type === "text" && ev.text) {
+                  stream.text += ev.text;
+                } else if (ev.type === "reasoning" && ev.text) {
+                  stream.reasoning += ev.text;
+                } else if (ev.type === "tool" && ev.toolName) {
+                  stream.tools.push({ name: ev.toolName, detail: ev.toolDetail });
+                } else if (ev.type === "error" && ev.text) {
+                  stream.error = ev.text;
+                }
+                this.scheduleRender();
+              },
+            });
+
+            stream.done = true;
+            if (res.sessionId) {
+              this.session.agentSessions[target.agent] = res.sessionId;
+            }
+            this.scheduleRender();
+
+            return { target, res };
+          }),
+        );
+
+        for (const { target, res } of results) {
+          const agentConfig = this.config.agents[target.agent] ?? {};
+          this.session.messages.push({
+            id: createMessageId(),
+            role: "assistant",
+            agent: target.agent,
+            model: target.model ?? agentConfig.model,
+            content: res.text,
+            reasoning: res.reasoning || undefined,
+            tools: res.tools.length > 0 ? res.tools : undefined,
+            timestamp: new Date().toISOString(),
+            durationMs: res.durationMs,
+            error: res.error,
+            aborted: res.aborted,
+          });
+        }
+
+        saveSession(this.session);
+      }
     } finally {
       if (this.spinnerTimer) {
         clearInterval(this.spinnerTimer);
@@ -1270,10 +1423,11 @@ export class UnifiedChatTui {
     const msgCount = this.session.messages.filter((m) => m.role !== "system").length;
     const activeModel = this.modelOverrides[this.activeAgent] ?? this.config.agents[this.activeAgent]?.model;
     const modelPart = activeModel ? `  •  model: ${activeModel}` : "  •  model: default";
+    const discPart = this.agentDiscussion ? `  •  discuss: on (${this.discussionRounds}r)` : "";
     const ctxPart = `context: ${this.shareContext ? "on" : "off"} (${msgCount} msgs)`;
     const row2 = truncateVisible(
       style(
-        ` dir: ${dirName}  •  session: ${this.session.name}  •  ${ctxPart}${modelPart}  •  Ctrl+O: models  •  /help`,
+        ` dir: ${dirName}  •  session: ${this.session.name}  •  ${ctxPart}${modelPart}${discPart}  •  Ctrl+O: models  •  /help`,
         DIM,
       ),
       cols,
@@ -1342,9 +1496,11 @@ export class UnifiedChatTui {
       }
 
       if (msg.role === "user") {
-        const targetSuffix = msg.agent
-          ? ` ${style("→", DIM)} ${style(`--${msg.agent}`, agentFg(msg.agent), BOLD)}`
-          : "";
+        const targetSuffix = msg.roundLabel
+          ? ` ${style("→", DIM)} ${style(msg.roundLabel, FG.brightCyan, BOLD)}`
+          : msg.agent
+            ? ` ${style("→", DIM)} ${style(`--${msg.agent}`, agentFg(msg.agent), BOLD)}`
+            : "";
         lines.push(`  ${style("❯ You", BOLD, FG.brightWhite)}${targetSuffix}`);
         for (const wl of wrapPlainText(msg.content, Math.max(12, cols - 4))) {
           lines.push("    " + style(wl, FG.white));
@@ -1356,9 +1512,10 @@ export class UnifiedChatTui {
       if (msg.role === "assistant") {
         const agent = msg.agent ?? "claude";
         const modelStr = msg.model ? style(` (${msg.model})`, DIM) : "";
+        const roundStr = msg.roundLabel ? style(` [${msg.roundLabel}]`, FG.brightCyan) : "";
         const durStr = msg.durationMs !== undefined ? style(` · ${formatDuration(msg.durationMs)}`, DIM) : "";
         const abortStr = msg.aborted ? style(" · cancelled", FG.yellow) : "";
-        lines.push(`  ${agentBadge(agent, false)}${modelStr}${durStr}${abortStr}`);
+        lines.push(`  ${agentBadge(agent, false)}${modelStr}${roundStr}${durStr}${abortStr}`);
 
         if (msg.tools && msg.tools.length > 0) {
           for (const t of msg.tools.slice(-8)) {
@@ -1393,8 +1550,9 @@ export class UnifiedChatTui {
         : style(SPINNER_FRAMES[this.spinnerIdx], agentFg(stream.agent), BOLD);
       const elapsed = formatDuration(Date.now() - stream.startedAt);
       const modelStr = stream.model ? style(` (${stream.model})`, DIM) : "";
+      const roundStr = stream.roundLabel ? style(` [${stream.roundLabel}]`, FG.brightCyan) : "";
       lines.push(
-        `  ${spin} ${agentBadge(stream.agent, true)}${modelStr} ${style(stream.done ? `done (${elapsed})` : `streaming… ${elapsed}`, DIM)}`,
+        `  ${spin} ${agentBadge(stream.agent, true)}${modelStr}${roundStr} ${style(stream.done ? `done (${elapsed})` : `streaming… ${elapsed}`, DIM)}`,
       );
 
       if (stream.tools.length > 0) {
@@ -1493,28 +1651,28 @@ export class UnifiedChatTui {
   }
 
   private styleInputLine(raw: string): string {
-    // Highlight leading --agent[:model] / @agent[:model] flags or /command in the prompt box
+    // Highlight /commands, --agent[:model] / --agent --<model>, and --discuss / --agent discussion anywhere in the line
     if (raw.startsWith("/")) {
       const spaceIdx = raw.search(/\s/);
       if (spaceIdx === -1) return style(raw, FG.brightCyan, BOLD);
       return style(raw.slice(0, spaceIdx), FG.brightCyan, BOLD) + raw.slice(spaceIdx);
     }
 
-    return raw.replace(
-      /^((?:(?:--(?:claude|codex|agy|deepseek|kimi)(?::\S+)?|@(?:claude|codex|agy|deepseek|kimi)(?::\S+)?|--model(?:=\S+|\s+\S+)|-m\s+\S+)\s*)+)/i,
-      (matched) =>
-        matched.replace(
-          /(--|@)(claude|codex|agy|deepseek|kimi)(:\S+)?/gi,
-          (tok, _p, name: string, modelPart?: string) => {
-            const id = name.toLowerCase() as AgentId;
-            if (modelPart) {
-              const base = tok.slice(0, tok.length - modelPart.length);
-              return style(base, agentFg(id), BOLD) + style(modelPart, FG.brightWhite, BOLD);
-            }
-            return style(tok, agentFg(id), BOLD);
-          },
-        ),
+    let out = raw.replace(
+      /(^|\s)(--agent\s+discussion|--agent-discussion|--discuss(?:ion)?|--no-discuss(?:ion)?|--debate|--models|--no-synthesis|--rounds(?:=\d+|\s+\d+)?)(?=\s|$)/gi,
+      (_m, lead: string, flag: string) => `${lead}${style(flag, FG.brightCyan, BOLD)}`,
     );
+
+    out = out.replace(
+      /(^|\s)(--|@)(claude|codex|agy|deepseek|kimi)(:\S+)?(?=\s|$)/gi,
+      (_m, lead: string, prefix: string, name: string, modelPart?: string) => {
+        const id = name.toLowerCase() as AgentId;
+        const base = style(`${prefix}${name}`, agentFg(id), BOLD);
+        return modelPart ? `${lead}${base}${style(modelPart, FG.brightWhite, BOLD)}` : `${lead}${base}`;
+      },
+    );
+
+    return out;
   }
 
   private render(): void {

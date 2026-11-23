@@ -71,6 +71,30 @@ Inside the TUI:
 - `/export [file.md]` — Export full conversation to Markdown
 - `/config` — Show config file location
 
+### Multi-Firm / Multi-Model Jobs & Optional Agent Discussion
+
+Combine multiple firms and specific models on a single job using either `--agent --<model>` or `--agent:<model>` syntax (anywhere in the prompt):
+
+```bash
+# Parallel independent responses from two firms + specific models
+mcli --codex --gpt-5.6-sol --claude --opus "investigate the heavy quarks"
+
+# Enable multi-round peer discussion + final consensus synthesis
+mcli --codex --gpt-5.6-sol --claude --opus --agent discussion "investigate the heavy quarks"
+
+# Equivalent shorthand with custom round count (default: 2 rounds + synthesis)
+mcli --codex --gpt-5.6-sol --claude --opus --discuss --rounds 3 "investigate the heavy quarks"
+
+# Even compare two models from the same firm
+mcli --claude --opus --claude --sonnet --discuss "compare these two proofs"
+```
+
+**How Agent Discussion works (opt-in):**
+- **Round 1 (Independent Analysis):** Each selected firm/model investigates the prompt independently so there is no anchoring bias.
+- **Round 2..N (Peer Discussion):** Each agent reads the other agents' previous responses, challenges gaps/errors, incorporates valid points, and refines its answer.
+- **Final Synthesis:** Produces a consolidated consensus summary (points of agreement, key disagreements, and final answer). Skip with `--no-synthesis`.
+- **Toggleable default:** Use `/discuss on` (or `/discuss rounds 3`) inside the TUI, or set `"agentDiscussion": true` in `~/.mcli/config.json`. Override per job with `--discuss` / `--agent discussion` or `--no-discuss`.
+
 ### Choosing Models
 
 There are 4 ways to choose models per agent:

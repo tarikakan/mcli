@@ -171,7 +171,7 @@ export function buildPromptWithContext(opts: {
     const speaker =
       msg.role === "user"
         ? "User"
-        : `Assistant (${msg.agent ? AGENT_META[msg.agent].label : "agent"})`;
+        : `Assistant (${msg.agent ? AGENT_META[msg.agent].label : "agent"}${msg.model ? ` / ${msg.model}` : ""}${msg.roundLabel ? ` · ${msg.roundLabel}` : ""})`;
 
     let body = msg.content.trim();
     if (msg.tools && msg.tools.length > 0) {
@@ -234,7 +234,8 @@ export function exportSessionMarkdown(session: SessionData): string {
     } else if (msg.role === "assistant") {
       const label = msg.agent ? AGENT_META[msg.agent].label : "Assistant";
       const modelNote = msg.model ? ` (${msg.model})` : "";
-      lines.push(`## ${label}${modelNote}`);
+      const roundNote = msg.roundLabel ? ` — ${msg.roundLabel}` : "";
+      lines.push(`## ${label}${modelNote}${roundNote}`);
       lines.push(``);
       if (msg.tools && msg.tools.length > 0) {
         lines.push(

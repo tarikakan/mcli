@@ -4,6 +4,7 @@ import readline from "node:readline";
 import { detectAllAgents, getAdapter } from "../adapters/index.ts";
 import { isAgentId, parseInlineInput } from "../cli-args.ts";
 import { getConfigPath, saveConfig } from "../config.ts";
+import { runAgentDiscussion } from "../discussion.ts";
 import { discoverAllAgentModels, discoverModelsForAgent, resolveModelAlias } from "../models.ts";
 import {
   buildPromptWithContext,
@@ -13,8 +14,8 @@ import {
   loadOrCreateSession,
   saveSession,
 } from "../session.ts";
-import { AGENT_IDS, AGENT_META } from "../types.ts";
-import type { AgentId, ChatMessage, McliConfig, SessionData, ToolEvent } from "../types.ts";
+import { AGENT_IDS, AGENT_META, formatTargetLabel } from "../types.ts";
+import type { AgentId, AgentTarget, ChatMessage, McliConfig, SessionData, ToolEvent } from "../types.ts";
 import {
   BOLD,
   DIM,
@@ -107,14 +108,41 @@ export async function formatModelsReport(
 
 export interface OneShotOptions {
   agents: AgentId[];
+  targets?: AgentTarget[];
   prompt: string;
   config: McliConfig;
   session: SessionData;
   cwd: string;
   modelOverride?: string;
   agentModels?: Partial<Record<AgentId, string>>;
+  discuss?: boolean;
+  discussionRounds?: number;
+  synthesize?: boolean;
   noContext?: boolean;
   saveToSession?: boolean;
+}
+
+function normalizeTargets(opts: {
+  agents: AgentId[];
+  targets?: AgentTarget[];
+  modelOverride?: string;
+  agentModels?: Partial<Record<AgentId, string>>;
+}): AgentTarget[] {
+  if (opts.targets && opts.targets.length > 0) {
+    return opts.targets.map((t) => ({
+      agent: t.agent,
+      model:
+        t.model ??
+        opts.agentModels?.[t.agent] ??
+        (opts.modelOverride ? resolveModelAlias(t.agent, opts.modelOverride) : undefined),
+    }));
+  }
+  return opts.agents.map((agent) => ({
+    agent,
+    model:
+      opts.agentModels?.[agent] ??
+      (opts.modelOverride ? resolveModelAlias(agent, opts.modelOverride) : undefined),
+  }));
 }
 
 export async function runOneShot(opts: OneShotOptions): Promise<number> {
@@ -128,12 +156,13 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     ? { ...opts.config, shareContext: false }
     : opts.config;
 
+  const targets = normalizeTargets(opts);
   const historySnapshot = [...opts.session.messages];
 
   const userMsg: ChatMessage = {
     id: createMessageId(),
     role: "user",
-    agent: opts.agents[0],
+    agent: targets[0]?.agent,
     content: opts.prompt,
     timestamp: new Date().toISOString(),
   };
@@ -142,88 +171,147 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   const assistantMessages: ChatMessage[] = [];
 
   try {
-    const multi = opts.agents.length > 1;
     const isTty = Boolean(process.stdout.isTTY);
+    const shouldDiscuss = Boolean(opts.discuss ?? opts.config.agentDiscussion) && targets.length >= 2;
 
-    for (const agent of opts.agents) {
-      if (controller.signal.aborted) break;
+    if (shouldDiscuss) {
+      const rounds = opts.discussionRounds ?? opts.config.discussionRounds ?? 2;
+      const synthesize = opts.synthesize !== false;
 
-      const adapter = getAdapter(agent);
-      const agentConfig = opts.config.agents[agent] ?? {};
-      const resolvedModel =
-        opts.agentModels?.[agent] ??
-        (opts.modelOverride ? resolveModelAlias(agent, opts.modelOverride) : undefined);
-      const fullPrompt = buildPromptWithContext({
-        userPrompt: opts.prompt,
-        history: historySnapshot,
-        targetAgent: agent,
-        config: effectiveConfig,
-      });
-
-      if (multi || isTty) {
+      if (isTty) {
+        const roster = targets.map((t) => formatTargetLabel(t)).join(" ↔ ");
         process.stderr.write(
-          `\n${agentBadge(agent, true)} ${style(`--${agent}`, DIM)}${resolvedModel ? style(` (${resolvedModel})`, DIM) : ""}\n`,
+          `\n${style("◆ Agent Discussion", BOLD, FG.brightCyan)} ${style(`(${rounds} rounds${synthesize ? " + synthesis" : ""})`, DIM)}\n` +
+            `${style(`  Participants: ${roster}`, DIM)}\n`,
         );
       }
 
-      const tools: ToolEvent[] = [];
       let streamedAnyText = false;
-
-      const result = await adapter.run({
-        prompt: fullPrompt,
-        rawUserPrompt: opts.prompt,
+      const discResult = await runAgentDiscussion({
+        targets,
+        userPrompt: opts.prompt,
         history: historySnapshot,
         cwd: opts.cwd,
-        model: resolvedModel,
-        sessionId: opts.session.agentSessions[agent],
-        config: agentConfig,
+        config: effectiveConfig,
+        rounds,
+        synthesize,
         signal: controller.signal,
-        onEvent: (ev) => {
-          if (ev.type === "text" && ev.text) {
+        parallel: false,
+        onRoundStart: ({ roundLabel }) => {
+          process.stderr.write(`\n${style(`━━ ${roundLabel} ━━`, BOLD, FG.brightCyan)}\n`);
+        },
+        onParticipantStart: ({ target, roundLabel }) => {
+          streamedAnyText = false;
+          const modelStr = target.model ? style(` (${target.model})`, DIM) : "";
+          process.stderr.write(
+            `\n${agentBadge(target.agent, true)} ${style(`--${target.agent}`, DIM)}${modelStr} ${style(`[${roundLabel}]`, DIM, FG.cyan)}\n`,
+          );
+        },
+        onParticipantEvent: ({ target, event }) => {
+          if (event.type === "text" && event.text) {
             streamedAnyText = true;
-            process.stdout.write(ev.text);
-          } else if (ev.type === "tool" && ev.toolName && isTty) {
-            const detail = ev.toolDetail ? `: ${ev.toolDetail}` : "";
-            process.stderr.write(style(`  ⚙ ${ev.toolName}${detail}\n`, DIM, FG.cyan));
-          } else if (ev.type === "error" && ev.text) {
-            process.stderr.write(style(`\n[${agent} error] ${ev.text}\n`, FG.brightRed));
+            process.stdout.write(event.text);
+          } else if (event.type === "tool" && event.toolName && isTty) {
+            const detail = event.toolDetail ? `: ${event.toolDetail}` : "";
+            process.stderr.write(style(`  ⚙ ${event.toolName}${detail}\n`, DIM, FG.cyan));
+          } else if (event.type === "error" && event.text) {
+            process.stderr.write(style(`\n[${target.agent} error] ${event.text}\n`, FG.brightRed));
+          }
+        },
+        onParticipantDone: ({ result }) => {
+          if (streamedAnyText && !result.text.endsWith("\n")) {
+            process.stdout.write("\n");
+          }
+          if (isTty) {
+            process.stderr.write(style(`  (${formatDuration(result.durationMs)})\n`, DIM));
           }
         },
       });
 
-      if (streamedAnyText && !result.text.endsWith("\n")) {
-        process.stdout.write("\n");
-      }
+      hadError = discResult.hadError;
+      Object.assign(opts.session.agentSessions, discResult.sessionIds);
+      assistantMessages.push(...discResult.messages);
+    } else {
+      const multi = targets.length > 1;
+      for (const target of targets) {
+        if (controller.signal.aborted) break;
 
-      if (result.sessionId) {
-        opts.session.agentSessions[agent] = result.sessionId;
-      }
+        const agent = target.agent;
+        const adapter = getAdapter(agent);
+        const agentConfig = opts.config.agents[agent] ?? {};
+        const resolvedModel = target.model;
+        const fullPrompt = buildPromptWithContext({
+          userPrompt: opts.prompt,
+          history: historySnapshot,
+          targetAgent: agent,
+          config: effectiveConfig,
+        });
 
-      if (result.error) hadError = true;
-      tools.push(...result.tools);
+        if (multi || isTty) {
+          process.stderr.write(
+            `\n${agentBadge(agent, true)} ${style(`--${agent}`, DIM)}${resolvedModel ? style(` (${resolvedModel})`, DIM) : ""}\n`,
+          );
+        }
 
-      assistantMessages.push({
-        id: createMessageId(),
-        role: "assistant",
-        agent,
-        model: resolvedModel ?? agentConfig.model,
-        content: result.text,
-        reasoning: result.reasoning || undefined,
-        tools: tools.length > 0 ? tools : undefined,
-        timestamp: new Date().toISOString(),
-        durationMs: result.durationMs,
-        error: result.error,
-        aborted: result.aborted,
-      });
+        const tools: ToolEvent[] = [];
+        let streamedAnyText = false;
 
-      if (isTty) {
-        process.stderr.write(style(`  (${formatDuration(result.durationMs)})\n`, DIM));
+        const result = await adapter.run({
+          prompt: fullPrompt,
+          rawUserPrompt: opts.prompt,
+          history: historySnapshot,
+          cwd: opts.cwd,
+          model: resolvedModel,
+          sessionId: opts.session.agentSessions[agent],
+          config: agentConfig,
+          signal: controller.signal,
+          onEvent: (ev) => {
+            if (ev.type === "text" && ev.text) {
+              streamedAnyText = true;
+              process.stdout.write(ev.text);
+            } else if (ev.type === "tool" && ev.toolName && isTty) {
+              const detail = ev.toolDetail ? `: ${ev.toolDetail}` : "";
+              process.stderr.write(style(`  ⚙ ${ev.toolName}${detail}\n`, DIM, FG.cyan));
+            } else if (ev.type === "error" && ev.text) {
+              process.stderr.write(style(`\n[${agent} error] ${ev.text}\n`, FG.brightRed));
+            }
+          },
+        });
+
+        if (streamedAnyText && !result.text.endsWith("\n")) {
+          process.stdout.write("\n");
+        }
+
+        if (result.sessionId) {
+          opts.session.agentSessions[agent] = result.sessionId;
+        }
+
+        if (result.error) hadError = true;
+        tools.push(...result.tools);
+
+        assistantMessages.push({
+          id: createMessageId(),
+          role: "assistant",
+          agent,
+          model: resolvedModel ?? agentConfig.model,
+          content: result.text,
+          reasoning: result.reasoning || undefined,
+          tools: tools.length > 0 ? tools : undefined,
+          timestamp: new Date().toISOString(),
+          durationMs: result.durationMs,
+          error: result.error,
+          aborted: result.aborted,
+        });
+
+        if (isTty) {
+          process.stderr.write(style(`  (${formatDuration(result.durationMs)})\n`, DIM));
+        }
       }
     }
 
     if (opts.saveToSession !== false) {
       opts.session.messages.push(userMsg, ...assistantMessages);
-      opts.session.activeAgent = opts.agents[opts.agents.length - 1] ?? opts.session.activeAgent;
+      opts.session.activeAgent = targets[targets.length - 1]?.agent ?? opts.session.activeAgent;
       saveSession(opts.session);
     }
   } finally {
@@ -240,11 +328,15 @@ export interface PlainReplOptions {
   initialAgent: AgentId;
   modelOverride?: string;
   agentModels?: Partial<Record<AgentId, string>>;
+  agentDiscussion?: boolean;
+  discussionRounds?: number;
 }
 
 export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
   let activeAgent: AgentId = opts.initialAgent;
   let shareContext = opts.config.shareContext;
+  let agentDiscussion = opts.agentDiscussion ?? opts.config.agentDiscussion;
+  let discussionRounds = opts.discussionRounds ?? opts.config.discussionRounds;
   const modelOverrides: Partial<Record<AgentId, string>> = { ...opts.agentModels };
   if (opts.modelOverride) {
     modelOverrides[activeAgent] = resolveModelAlias(activeAgent, opts.modelOverride);
@@ -334,6 +426,27 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
         else if (args === "off") shareContext = false;
         else shareContext = !shareContext;
         console.log(style(`Shared cross-agent context: ${shareContext ? "ON" : "OFF"}`, FG.cyan));
+      } else if (cmd === "discuss" || cmd === "discussion") {
+        const parts = args.split(/\s+/).filter(Boolean);
+        if (parts[0] === "on") {
+          agentDiscussion = true;
+        } else if (parts[0] === "off") {
+          agentDiscussion = false;
+        } else if (parts[0] === "rounds" && parts[1]) {
+          const n = Number.parseInt(parts[1], 10);
+          if (Number.isFinite(n) && n >= 1) {
+            discussionRounds = Math.min(6, n);
+            agentDiscussion = true;
+          }
+        } else {
+          agentDiscussion = !agentDiscussion;
+        }
+        console.log(
+          style(
+            `Agent discussion: ${agentDiscussion ? `ON (${discussionRounds} rounds + synthesis)` : "OFF (use --discuss or --agent discussion per job)"}`,
+            FG.cyan,
+          ),
+        );
       } else if (cmd === "models") {
         const filter = args
           .split(/\s+/)
@@ -445,27 +558,45 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
       continue;
     }
 
-    const targetAgents = parsed.agents.length > 0 ? parsed.agents : [activeAgent];
-    if (parsed.agents.length === 1) {
-      activeAgent = parsed.agents[0];
+    const targets: AgentTarget[] =
+      parsed.targets.length > 0
+        ? parsed.targets.map((t) => ({
+            agent: t.agent,
+            model:
+              t.model ??
+              (parsed.modelOverride ? resolveModelAlias(t.agent, parsed.modelOverride) : undefined) ??
+              modelOverrides[t.agent],
+          }))
+        : [
+            {
+              agent: activeAgent,
+              model:
+                (parsed.modelOverride ? resolveModelAlias(activeAgent, parsed.modelOverride) : undefined) ??
+                modelOverrides[activeAgent],
+            },
+          ];
+
+    if (targets.length === 1 && parsed.targets.length === 1) {
+      activeAgent = targets[0].agent;
     }
 
-    const turnModels: Partial<Record<AgentId, string>> = {};
-    for (const ag of targetAgents) {
-      const m =
-        parsed.agentModels[ag] ??
-        (parsed.modelOverride ? resolveModelAlias(ag, parsed.modelOverride) : undefined) ??
-        modelOverrides[ag];
-      if (m) turnModels[ag] = m;
+    const useDiscuss = parsed.discuss ?? agentDiscussion;
+    if (useDiscuss && targets.length < 2) {
+      console.log(
+        style("Note: --agent discussion needs 2+ agents/models (e.g. --codex --gpt-5.6-sol --claude --opus). Running single agent.", FG.yellow),
+      );
     }
 
     await runOneShot({
-      agents: targetAgents,
+      agents: targets.map((t) => t.agent),
+      targets,
       prompt: parsed.prompt,
-      config: { ...opts.config, shareContext },
+      config: { ...opts.config, shareContext, agentDiscussion, discussionRounds },
       session: opts.session,
       cwd: opts.cwd,
-      agentModels: turnModels,
+      discuss: useDiscuss,
+      discussionRounds: parsed.discussionRounds ?? discussionRounds,
+      synthesize: !parsed.noSynthesis,
       saveToSession: true,
     });
   }
