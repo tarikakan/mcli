@@ -56,13 +56,19 @@ import {
   agentBg,
   agentFg,
   copyToClipboard,
+  extractSelectionText,
+  findWordBounds,
   formatDuration,
+  highlightVisibleRange,
+  normalizeSelection,
   padRightVisible,
+  readFromClipboard,
   renderMarkdownLines,
   stripAnsi,
   style,
   truncateVisible,
   wrapPlainText,
+  writeOsc52Clipboard,
 } from "./ansi.ts";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -92,35 +98,61 @@ const SLASH_COMMANDS = [
 export interface ParsedMouseSequence {
   length: number;
   wheel?: "up" | "down";
+  kind?: "press" | "drag" | "release";
+  button?: number;
+  col?: number;
+  row?: number;
 }
 
 /**
  * Parses SGR (\x1b[<b;x;yM / m) and legacy X10 (\x1b[Mbxy) terminal mouse
- * sequences at the start of `rest`. Returns consumed length and wheel direction.
+ * sequences at the start of `rest`. Returns consumed length, wheel direction,
+ * and click/drag/release coordinates (1-based col & row).
  */
 export function parseMouseSequence(rest: string): ParsedMouseSequence | undefined {
   // SGR mouse protocol: ESC [ < Cb ; Cx ; Cy (M|m)
   const sgr = rest.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
   if (sgr) {
     const cb = Number.parseInt(sgr[1], 10);
-    const kind = sgr[4];
-    if (kind === "M" && (cb & 64) !== 0) {
+    const col = Number.parseInt(sgr[2], 10);
+    const row = Number.parseInt(sgr[3], 10);
+    const terminator = sgr[4];
+
+    if (terminator === "M" && (cb & 64) !== 0) {
       const dir = cb & 3;
-      if (dir === 0) return { length: sgr[0].length, wheel: "up" };
-      if (dir === 1) return { length: sgr[0].length, wheel: "down" };
+      if (dir === 0) return { length: sgr[0].length, wheel: "up", col, row };
+      if (dir === 1) return { length: sgr[0].length, wheel: "down", col, row };
+      return { length: sgr[0].length, col, row };
     }
-    return { length: sgr[0].length };
+
+    const button = cb & 3;
+    if (terminator === "m") {
+      return { length: sgr[0].length, kind: "release", button, col, row };
+    }
+    if ((cb & 32) !== 0) {
+      return { length: sgr[0].length, kind: "drag", button, col, row };
+    }
+    return { length: sgr[0].length, kind: "press", button, col, row };
   }
 
   // Legacy X10 mouse protocol: ESC [ M Cb Cx Cy (6 chars total)
   if (rest.startsWith("\x1b[M") && rest.length >= 6) {
     const cb = rest.charCodeAt(3) - 32;
+    const col = rest.charCodeAt(4) - 32;
+    const row = rest.charCodeAt(5) - 32;
     if ((cb & 64) !== 0) {
       const dir = cb & 3;
-      if (dir === 0) return { length: 6, wheel: "up" };
-      if (dir === 1) return { length: 6, wheel: "down" };
+      if (dir === 0) return { length: 6, wheel: "up", col, row };
+      if (dir === 1) return { length: 6, wheel: "down", col, row };
     }
-    return { length: 6 };
+    const button = cb & 3;
+    if (button === 3) {
+      return { length: 6, kind: "release", button: 0, col, row };
+    }
+    if ((cb & 32) !== 0) {
+      return { length: 6, kind: "drag", button, col, row };
+    }
+    return { length: 6, kind: "press", button, col, row };
   }
 
   return undefined;
@@ -175,6 +207,27 @@ export class UnifiedChatTui {
   private scrollOffset = 0; // 0 = pinned to bottom; >0 = scrolled up by N lines
   private lastTotalLines = 0;
   private lastViewportHeight = 10;
+  private lastHeaderHeight = 3;
+  private lastStartIdx = 0;
+  private lastPlainLines: string[] = [];
+  private lastInputRowIndex = 23;
+  private lastInputPrefixLen = 12;
+  private lastInputWindowStart = 0;
+
+  private selection: {
+    anchorLine: number;
+    anchorCol: number;
+    focusLine: number;
+    focusCol: number;
+  } | null = null;
+  private isDraggingSelection = false;
+  private lastClickAt = 0;
+  private lastClickLine = -1;
+  private lastClickCol = -1;
+  private clickCount = 0;
+
+  private inBracketedPaste = false;
+  private pasteBuffer = "";
 
   private activeController: AbortController | null = null;
   private liveStreams: LiveStream[] = [];
@@ -248,20 +301,219 @@ export class UnifiedChatTui {
   private setMouseTracking(enabled: boolean): void {
     this.mouseEnabled = enabled;
     if (enabled) {
-      // Enable normal mouse button/wheel tracking + SGR extended coordinates
-      process.stdout.write("\x1b[?1000h\x1b[?1006h");
+      // Enable click/wheel + button-drag tracking + SGR extended coordinates
+      process.stdout.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
     } else {
-      process.stdout.write("\x1b[?1006l\x1b[?1000l");
+      process.stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
     }
   }
 
   private enterAltScreen(): void {
-    process.stdout.write("\x1b[?1049h\x1b[?25h\x1b[2J\x1b[H");
+    // Alternate screen + bracketed paste mode (\x1b[?2004h)
+    process.stdout.write("\x1b[?1049h\x1b[?2004h\x1b[?25h\x1b[2J\x1b[H");
     this.setMouseTracking(this.mouseEnabled);
   }
 
   private leaveAltScreen(): void {
-    process.stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+    process.stdout.write("\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+  }
+
+  private insertTextAtCursor(rawText: string, announcePaste = false): void {
+    // Normalize pasted line endings so multi-line pastes insert cleanly without auto-submitting
+    const sanitized = rawText
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\n+/g, " ")
+      .replace(/\t/g, "  ");
+    if (!sanitized) return;
+
+    this.selection = null;
+    this.input = this.input.slice(0, this.cursor) + sanitized + this.input.slice(this.cursor);
+    this.cursor += sanitized.length;
+    this.historyIndex = -1;
+
+    if (announcePaste && sanitized.length > 0) {
+      this.setNotice(`Pasted ${sanitized.length} char${sanitized.length === 1 ? "" : "s"}.`, 2200);
+    } else {
+      this.scheduleRender();
+    }
+  }
+
+  private copySelectedText(silentIfEmpty = false): boolean {
+    if (!this.selection) return false;
+    const norm = normalizeSelection(this.selection);
+    const text = extractSelectionText(this.lastPlainLines, norm);
+    if (!text) {
+      if (!silentIfEmpty) this.setNotice("Selection is empty.", 1800);
+      return false;
+    }
+
+    const copied = copyToClipboard(text);
+    writeOsc52Clipboard(text);
+    const linesCount = text.split("\n").length;
+    const summary =
+      linesCount > 1
+        ? `${text.length} chars (${linesCount} lines)`
+        : `${text.length} char${text.length === 1 ? "" : "s"}`;
+    this.setNotice(
+      copied
+        ? `Copied ${summary} to clipboard (Cmd+V / Ctrl+V to paste).`
+        : `Sent ${summary} via OSC 52 clipboard.`,
+      2800,
+    );
+    return true;
+  }
+
+  private screenToContentPos(col1: number, row1: number): { line: number; col: number } | undefined {
+    if (this.lastPlainLines.length === 0) return undefined;
+    const viewportRow = row1 - this.lastHeaderHeight - 1; // 0-based inside viewport
+    const clampedViewportRow = Math.max(0, Math.min(this.lastViewportHeight - 1, viewportRow));
+    const lineIdx = Math.max(
+      0,
+      Math.min(this.lastPlainLines.length - 1, this.lastStartIdx + clampedViewportRow),
+    );
+    const lineLen = this.lastPlainLines[lineIdx]?.length ?? 0;
+    const col0 = Math.max(0, Math.min(Math.max(0, lineLen - 1), col1 - 1));
+    return { line: lineIdx, col: col0 };
+  }
+
+  private handleMouseEvent(mouse: ParsedMouseSequence): void {
+    if (mouse.wheel === "up") {
+      this.scrollChat(3);
+      return;
+    }
+    if (mouse.wheel === "down") {
+      this.scrollChat(-3);
+      return;
+    }
+
+    const col = mouse.col ?? 1;
+    const row = mouse.row ?? 1;
+
+    // Left-click inside the input box moves the text cursor there
+    if (mouse.kind === "press" && mouse.button === 0 && row === this.lastInputRowIndex) {
+      this.selection = null;
+      this.isDraggingSelection = false;
+      const relCol = col - 1 - this.lastInputPrefixLen;
+      this.cursor = Math.max(0, Math.min(this.input.length, this.lastInputWindowStart + relCol));
+      this.scheduleRender();
+      return;
+    }
+
+    // Middle-click pastes from clipboard (classic Unix terminal convenience)
+    if (mouse.kind === "press" && mouse.button === 1) {
+      const clip = readFromClipboard();
+      if (clip) this.insertTextAtCursor(clip, true);
+      return;
+    }
+
+    const inViewport =
+      row > this.lastHeaderHeight && row <= this.lastHeaderHeight + this.lastViewportHeight;
+
+    if (mouse.kind === "press" && mouse.button === 0) {
+      if (!inViewport) {
+        if (this.selection) {
+          this.selection = null;
+          this.scheduleRender();
+        }
+        return;
+      }
+
+      const pos = this.screenToContentPos(col, row);
+      if (!pos) return;
+
+      const now = Date.now();
+      const sameSpot =
+        now - this.lastClickAt < 450 &&
+        pos.line === this.lastClickLine &&
+        Math.abs(pos.col - this.lastClickCol) <= 2;
+      this.clickCount = sameSpot ? Math.min(3, this.clickCount + 1) : 1;
+      this.lastClickAt = now;
+      this.lastClickLine = pos.line;
+      this.lastClickCol = pos.col;
+
+      if (this.clickCount === 2) {
+        // Double-click: select whole word and copy immediately
+        const lineText = this.lastPlainLines[pos.line] ?? "";
+        const bounds = findWordBounds(lineText, pos.col);
+        if (bounds) {
+          this.selection = {
+            anchorLine: pos.line,
+            anchorCol: bounds.start,
+            focusLine: pos.line,
+            focusCol: bounds.end,
+          };
+          this.isDraggingSelection = false;
+          this.copySelectedText(true);
+          this.scheduleRender();
+          return;
+        }
+      } else if (this.clickCount === 3) {
+        // Triple-click: select entire trimmed line and copy immediately
+        const lineText = this.lastPlainLines[pos.line] ?? "";
+        const trimmedStart = lineText.search(/\S/);
+        const trimmedEnd = lineText.trimEnd().length - 1;
+        if (trimmedStart !== -1 && trimmedEnd >= trimmedStart) {
+          this.selection = {
+            anchorLine: pos.line,
+            anchorCol: trimmedStart,
+            focusLine: pos.line,
+            focusCol: trimmedEnd,
+          };
+          this.isDraggingSelection = false;
+          this.copySelectedText(true);
+          this.scheduleRender();
+          return;
+        }
+      }
+
+      // Single press: start drag selection
+      this.isDraggingSelection = true;
+      this.selection = {
+        anchorLine: pos.line,
+        anchorCol: pos.col,
+        focusLine: pos.line,
+        focusCol: pos.col,
+      };
+      this.scheduleRender();
+      return;
+    }
+
+    if (mouse.kind === "drag" && mouse.button === 0 && this.isDraggingSelection && this.selection) {
+      if (row <= this.lastHeaderHeight) {
+        this.scrollChat(1);
+      } else if (row > this.lastHeaderHeight + this.lastViewportHeight) {
+        this.scrollChat(-1);
+      }
+      const pos = this.screenToContentPos(col, row);
+      if (pos) {
+        this.selection.focusLine = pos.line;
+        this.selection.focusCol = pos.col;
+        this.scheduleRender();
+      }
+      return;
+    }
+
+    if (mouse.kind === "release" && this.isDraggingSelection) {
+      this.isDraggingSelection = false;
+      if (this.selection) {
+        const pos = this.screenToContentPos(col, row);
+        if (pos) {
+          this.selection.focusLine = pos.line;
+          this.selection.focusCol = pos.col;
+        }
+        const singleCharClick =
+          this.selection.anchorLine === this.selection.focusLine &&
+          this.selection.anchorCol === this.selection.focusCol;
+        if (singleCharClick) {
+          // Plain single click without dragging clears highlight
+          this.selection = null;
+        } else {
+          this.copySelectedText(true);
+        }
+        this.scheduleRender();
+      }
+    }
   }
 
   private scrollChat(deltaLines: number): void {
@@ -557,20 +809,40 @@ export class UnifiedChatTui {
 
     let i = 0;
     while (i < chunk.length) {
+      // Inside a bracketed paste (\x1b[200~ ... \x1b[201~): collect everything verbatim until end marker
+      if (this.inBracketedPaste) {
+        const endIdx = chunk.indexOf("\x1b[201~", i);
+        if (endIdx === -1) {
+          this.pasteBuffer += chunk.slice(i);
+          return;
+        }
+        this.pasteBuffer += chunk.slice(i, endIdx);
+        const pasted = this.pasteBuffer;
+        this.pasteBuffer = "";
+        this.inBracketedPaste = false;
+        this.insertTextAtCursor(pasted, true);
+        i = endIdx + "\x1b[201~".length;
+        continue;
+      }
+
       const ch = chunk[i];
 
-      // Escape sequences (mouse wheel, arrows, PgUp/PgDn, Home/End, Delete, Shift+Tab, Alt+keys)
+      // Escape sequences (bracketed paste, mouse wheel/selection, arrows, PgUp/PgDn, Home/End, Delete, Shift+Tab, Alt+keys)
       if (ch === "\x1b") {
         const rest = chunk.slice(i);
 
-        // Mouse wheel & click sequences (SGR and X10)
+        // Start of bracketed paste: \x1b[200~
+        if (rest.startsWith("\x1b[200~")) {
+          this.inBracketedPaste = true;
+          this.pasteBuffer = "";
+          i += "\x1b[200~".length;
+          continue;
+        }
+
+        // Mouse wheel, click, drag selection & release (SGR and X10)
         const mouse = parseMouseSequence(rest);
         if (mouse) {
-          if (mouse.wheel === "up") {
-            this.scrollChat(3);
-          } else if (mouse.wheel === "down") {
-            this.scrollChat(-3);
-          }
+          this.handleMouseEvent(mouse);
           i += mouse.length;
           continue;
         }
@@ -608,10 +880,12 @@ export class UnifiedChatTui {
           }
         }
 
-        // Plain Esc: abort active stream or clear input
+        // Plain Esc: abort active stream, clear selection, or jump to bottom
         if (this.activeController) {
           this.activeController.abort();
           this.setNotice("Cancelling active agent run…");
+        } else if (this.selection) {
+          this.selection = null;
         } else if (this.scrollOffset > 0) {
           this.scrollOffset = 0;
         }
@@ -719,6 +993,36 @@ export class UnifiedChatTui {
       if (ch === "\x0b") {
         this.input = this.input.slice(0, this.cursor);
         this.scheduleRender();
+        i++;
+        continue;
+      }
+
+      // Ctrl+V (Paste from system clipboard)
+      if (ch === "\x16") {
+        const clip = readFromClipboard();
+        if (clip) {
+          this.insertTextAtCursor(clip, true);
+        } else {
+          this.setNotice("Clipboard is empty or clipboard utility unavailable.", 2000);
+        }
+        i++;
+        continue;
+      }
+
+      // Ctrl+Y (Copy current selection, or last assistant response if nothing selected)
+      if (ch === "\x19") {
+        if (!this.copySelectedText(true)) {
+          const last = [...this.session.messages]
+            .reverse()
+            .find((m) => m.role === "assistant" && m.content.trim().length > 0);
+          if (last) {
+            copyToClipboard(last.content);
+            writeOsc52Clipboard(last.content);
+            this.setNotice(`Copied ${AGENT_META[last.agent ?? "claude"].label}'s last response to clipboard.`, 2500);
+          } else {
+            this.setNotice("Nothing selected or available to copy.", 2000);
+          }
+        }
         i++;
         continue;
       }
@@ -1007,7 +1311,8 @@ export class UnifiedChatTui {
             "**Shortcuts:**",
             "- `Ctrl+O`: open interactive model picker (`Up`/`Down` select, `Tab` switch agent, `S` save default)",
             "- `Tab` / `Shift+Tab`: autocomplete `--flags` or `/commands`, or cycle active agent",
-            "- `PgUp` / `PgDn`, mouse wheel, or `Alt+Up` / `Alt+Down`: scroll conversation (hold `Shift`/`Option` to select text, or `/mouse` to toggle)",
+            "- **Select & Copy:** Click-drag to highlight any words/sentences (auto-copies on release!), double-click a word, triple-click a line, or press `Ctrl+Y` (`Cmd+V` / `Ctrl+V` to paste)",
+            "- `PgUp` / `PgDn`, mouse wheel, or `Alt+Up` / `Alt+Down`: scroll conversation (`/mouse off` for raw terminal selection)",
             "- `Up` / `Down`: prompt history",
             "- `Ctrl+C` / `Esc`: cancel active streaming response without quitting",
             "",
@@ -2060,6 +2365,7 @@ export class UnifiedChatTui {
     const rows = Math.max(12, process.stdout.rows || 24);
 
     const headerLines = this.buildHeaderLines(cols); // 3 rows
+    this.lastHeaderHeight = headerLines.length;
     const footerHeight = 3; // divider + input + hint
     const viewportHeight = Math.max(4, rows - headerLines.length - footerHeight);
     this.lastViewportHeight = viewportHeight;
@@ -2068,6 +2374,7 @@ export class UnifiedChatTui {
       ? this.buildModelPickerLines(cols)
       : this.buildConversationLines(cols);
     this.lastTotalLines = contentLines.length;
+    this.lastPlainLines = contentLines.map((l) => stripAnsi(truncateVisible(l, cols)));
 
     const effectiveScroll = this.modelPicker ? 0 : this.scrollOffset;
     const maxScroll = Math.max(0, contentLines.length - viewportHeight);
@@ -2079,7 +2386,22 @@ export class UnifiedChatTui {
       ? Math.min(contentLines.length, viewportHeight)
       : contentLines.length - effectiveScroll;
     const startIdx = this.modelPicker ? 0 : Math.max(0, endIdx - viewportHeight);
-    const visibleLines = contentLines.slice(startIdx, endIdx);
+    this.lastStartIdx = startIdx;
+
+    const normSel = !this.modelPicker && this.selection ? normalizeSelection(this.selection) : null;
+    const visibleLines = contentLines.slice(startIdx, endIdx).map((rawLine, idx) => {
+      const absLine = startIdx + idx;
+      const truncated = truncateVisible(rawLine, cols);
+      if (normSel && absLine >= normSel.startLine && absLine <= normSel.endLine) {
+        const plainLen = this.lastPlainLines[absLine]?.length ?? 0;
+        const sCol = absLine === normSel.startLine ? normSel.startCol : 0;
+        const eCol = absLine === normSel.endLine ? normSel.endCol : Math.max(0, plainLen - 1);
+        if (plainLen > 0) {
+          return highlightVisibleRange(truncated, sCol, eCol);
+        }
+      }
+      return truncated;
+    });
 
     while (visibleLines.length < viewportHeight) {
       visibleLines.push("");
@@ -2106,6 +2428,8 @@ export class UnifiedChatTui {
     if (this.cursor > availableInputWidth - 2) {
       windowStart = this.cursor - (availableInputWidth - 2);
     }
+    this.lastInputPrefixLen = prefixPlain.length;
+    this.lastInputWindowStart = windowStart;
     const visibleInput = this.input.slice(windowStart, windowStart + availableInputWidth);
     const styledInput =
       windowStart === 0 ? this.styleInputLine(visibleInput) : visibleInput;
@@ -2132,7 +2456,7 @@ export class UnifiedChatTui {
       hintText = style(` Tab: complete "${suggestion.trim()}"`, DIM, FG.cyan);
     } else {
       hintText = style(
-        " --agent[:model]  •  Ctrl+O / /model: pick model  •  Tab: cycle agent  •  /help",
+        " Drag/2x-click: select & copy  •  Cmd+V/Ctrl+V: paste  •  Ctrl+O: models  •  /help",
         DIM,
       );
     }
@@ -2140,7 +2464,7 @@ export class UnifiedChatTui {
 
     const frameRows = [
       ...headerLines,
-      ...visibleLines.map((l) => padRightVisible(truncateVisible(l, cols), cols)),
+      ...visibleLines.map((l) => padRightVisible(l, cols)),
       footerDivider,
       inputRow,
       hintRow,
@@ -2153,8 +2477,9 @@ export class UnifiedChatTui {
     }
 
     // Position real terminal cursor inside the input row (hide while model picker is open)
+    const inputRowIndex = headerLines.length + viewportHeight + 2; // 1-based row
+    this.lastInputRowIndex = inputRowIndex;
     if (!this.modelPicker) {
-      const inputRowIndex = headerLines.length + viewportHeight + 2; // 1-based row
       const cursorCol = Math.min(cols, prefixPlain.length + (this.cursor - windowStart) + 1);
       out += `\x1b[${inputRowIndex};${cursorCol}H\x1b[?25h`;
     }

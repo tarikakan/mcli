@@ -291,3 +291,164 @@ export function copyToClipboard(text: string): boolean {
   }
   return false;
 }
+
+export function readFromClipboard(): string | undefined {
+  const candidates: Array<[string, string[]]> =
+    process.platform === "darwin"
+      ? [["pbpaste", []]]
+      : [
+          ["wl-paste", ["-n"]],
+          ["xclip", ["-selection", "clipboard", "-o"]],
+          ["xsel", ["--clipboard", "--output"]],
+        ];
+
+  for (const [cmd, args] of candidates) {
+    const res = spawnSync(cmd, args, { encoding: "utf8" });
+    if (!res.error && res.status === 0 && typeof res.stdout === "string") {
+      return res.stdout;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Emits an OSC 52 escape sequence so clipboard copy also works over SSH/tmux.
+ */
+export function writeOsc52Clipboard(text: string): void {
+  if (!process.stdout.isTTY) return;
+  const b64 = Buffer.from(text, "utf8").toString("base64");
+  process.stdout.write(`\x1b]52;c;${b64}\x07`);
+}
+
+/**
+ * Applies reverse-video highlight (\x1b[7m ... \x1b[27m) to visible columns
+ * [startCol, endCol] (inclusive, 0-based) of an ANSI-styled line without
+ * breaking existing colors.
+ */
+export function highlightVisibleRange(
+  ansiLine: string,
+  startCol: number,
+  endCol: number,
+): string {
+  const from = Math.max(0, startCol);
+  const to = Math.max(from, endCol);
+  const plainLen = visibleLength(ansiLine);
+  if (plainLen === 0 || from >= plainLen) return ansiLine;
+
+  const clampedTo = Math.min(to, plainLen - 1);
+  let out = "";
+  let vis = 0;
+  let i = 0;
+  let inHighlight = false;
+
+  while (i < ansiLine.length) {
+    if (ansiLine[i] === "\x1b" && ansiLine[i + 1] === "[") {
+      const match = ansiLine.slice(i).match(/^\x1b\[[0-9;?]*[a-zA-Z]/);
+      if (match) {
+        out += match[0];
+        // Re-apply reverse video if an inner reset occurred inside the selected range
+        if (inHighlight && (match[0] === "\x1b[0m" || match[0] === "\x1b[m")) {
+          out += "\x1b[7m";
+        }
+        i += match[0].length;
+        continue;
+      }
+    }
+
+    if (vis === from && !inHighlight) {
+      out += "\x1b[7m";
+      inHighlight = true;
+    }
+
+    out += ansiLine[i];
+
+    if (vis === clampedTo && inHighlight) {
+      out += "\x1b[27m";
+      inHighlight = false;
+    }
+
+    vis++;
+    i++;
+  }
+
+  if (inHighlight) {
+    out += "\x1b[27m";
+  }
+  return out;
+}
+
+export interface NormalizedSelection {
+  startLine: number;
+  startCol: number;
+  endLine: number;
+  endCol: number;
+}
+
+export function normalizeSelection(sel: {
+  anchorLine: number;
+  anchorCol: number;
+  focusLine: number;
+  focusCol: number;
+}): NormalizedSelection {
+  if (
+    sel.anchorLine < sel.focusLine ||
+    (sel.anchorLine === sel.focusLine && sel.anchorCol <= sel.focusCol)
+  ) {
+    return {
+      startLine: sel.anchorLine,
+      startCol: sel.anchorCol,
+      endLine: sel.focusLine,
+      endCol: sel.focusCol,
+    };
+  }
+  return {
+    startLine: sel.focusLine,
+    startCol: sel.focusCol,
+    endLine: sel.anchorLine,
+    endCol: sel.anchorCol,
+  };
+}
+
+export function extractSelectionText(
+  plainLines: string[],
+  sel: NormalizedSelection,
+): string {
+  if (plainLines.length === 0) return "";
+  const startLine = Math.max(0, Math.min(sel.startLine, plainLines.length - 1));
+  const endLine = Math.max(startLine, Math.min(sel.endLine, plainLines.length - 1));
+
+  if (startLine === endLine) {
+    const line = plainLines[startLine] ?? "";
+    return line.slice(Math.max(0, sel.startCol), Math.max(0, sel.endCol) + 1);
+  }
+
+  const parts: string[] = [];
+  for (let l = startLine; l <= endLine; l++) {
+    const line = plainLines[l] ?? "";
+    if (l === startLine) {
+      parts.push(line.slice(Math.max(0, sel.startCol)).trimEnd());
+    } else if (l === endLine) {
+      parts.push(line.slice(0, Math.max(0, sel.endCol) + 1).trimEnd());
+    } else {
+      parts.push(line.trimEnd());
+    }
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Finds the start/end 0-based column bounds of the word under `col` for double-click selection.
+ */
+export function findWordBounds(line: string, col: number): { start: number; end: number } | undefined {
+  if (!line || col < 0 || col >= line.length) return undefined;
+  const isWordChar = (ch: string): boolean => /[A-Za-z0-9_./:@-]/.test(ch);
+  const ch = line[col];
+  if (/\s/.test(ch)) return undefined;
+
+  const matcher = isWordChar(ch) ? isWordChar : (c: string) => !/\s/.test(c);
+  let start = col;
+  let end = col;
+  while (start > 0 && matcher(line[start - 1])) start--;
+  while (end < line.length - 1 && matcher(line[end + 1])) end++;
+  return { start, end };
+}

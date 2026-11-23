@@ -49,13 +49,16 @@ Inside the TUI:
 
 **Keyboard Shortcuts:**
 
-| Key | Action |
+| Key / Mouse | Action |
 | --- | --- |
+| **Click-drag** / **2x-click** / **3x-click** | Select any words, sentences, or multi-line blocks and **auto-copy to clipboard** |
+| `Cmd+V` / `Ctrl+V` / Middle-click | Paste from clipboard cleanly at cursor (bracketed paste — won't auto-submit) |
+| `Ctrl+Y` | Copy current selection (or last assistant response) |
 | `Ctrl+O` | Open interactive **Model Picker** (`↑`/`↓` select, `Tab` switch agent, `S` save default) |
-| `Tab` / `Shift+Tab` | Autocomplete `--flags` / `/commands`, or cycle active agent |
-| `PgUp` / `PgDn` or `Alt+Up` / `Alt+Down` | Scroll chat history |
+| `Tab` / `Shift+Tab` | Autocomplete `--flags`, `$skills`, `/commands`, or cycle active agent |
+| Mouse wheel / `PgUp` / `PgDn` / `Alt+↑`/`↓` | Scroll chat history |
 | `Up` / `Down` | Navigate prompt history |
-| `Ctrl+C` / `Esc` | Cancel active streaming agent without exiting |
+| `Ctrl+C` / `Esc` | Cancel active streaming agent (or clear selection) without exiting |
 | `Ctrl+D` or `/exit` | Exit `mcli` |
 
 **Slash Commands:**
