@@ -5,6 +5,7 @@ import { detectAllAgents, getAdapter } from "../adapters/index.ts";
 import { isAgentId, parseInlineInput, parsePermissionModeValue } from "../cli-args.ts";
 import { getConfigPath, saveConfig } from "../config.ts";
 import { runAgentDiscussion } from "../discussion.ts";
+import type { PermissionApprovalDecision } from "../discussion.ts";
 import {
   getEffectiveContextConfig,
   resolveMemoryScribe,
@@ -12,6 +13,12 @@ import {
   shouldAutoCompact,
 } from "../memory-agent.ts";
 import { discoverAllAgentModels, discoverModelsForAgent, resolveModelAlias } from "../models.ts";
+import {
+  detectPermissionRequest,
+  normalizeDirPath,
+  resolveExistingDir,
+} from "../permissions.ts";
+import type { DetectedPermissionRequest } from "../permissions.ts";
 import {
   buildPromptWithContext,
   buildSharedContextBlock,
@@ -171,6 +178,7 @@ export interface OneShotOptions {
   agents: AgentId[];
   targets?: AgentTarget[];
   skills?: string[];
+  addDirs?: string[];
   prompt: string;
   config: McliConfig;
   session: SessionData;
@@ -183,6 +191,11 @@ export interface OneShotOptions {
   synthesize?: boolean;
   noContext?: boolean;
   saveToSession?: boolean;
+  onPermissionRequest?: (info: {
+    participantLabel: string;
+    roundLabel?: string;
+    request: DetectedPermissionRequest;
+  }) => Promise<PermissionApprovalDecision>;
 }
 
 function normalizeTargets(opts: {
@@ -228,6 +241,17 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   const targets = normalizeTargets(opts);
   const historySnapshot = [...opts.session.messages];
   const transcriptPath = getSessionTranscriptPath(opts.session.id);
+  const effectiveAllowedDirs = Array.from(
+    new Set(
+      [
+        ...(opts.config.allowedDirs ?? []),
+        ...(opts.session.allowedDirs ?? []),
+        ...(opts.addDirs ?? []),
+      ]
+        .map((d) => normalizeDirPath(d, opts.cwd))
+        .filter(Boolean),
+    ),
+  );
 
   // Merge session-pinned skills with per-turn --skill / $skill requests
   const requestedSkillNames = Array.from(
@@ -291,20 +315,26 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
         summarizedUpTo: opts.session.summarizedUpTo,
         transcriptPath,
         skills: activeSkills,
+        allowedDirs: effectiveAllowedDirs,
         cwd: opts.cwd,
         config: effectiveConfig,
         rounds,
         synthesize,
         signal: controller.signal,
         parallel: false,
+        onPermissionRequest: opts.onPermissionRequest
+          ? async ({ participantLabel, roundLabel, request }) =>
+              opts.onPermissionRequest!({ participantLabel, roundLabel, request })
+          : undefined,
         onRoundStart: ({ roundLabel }) => {
           process.stderr.write(`\n${style(`━━ ${roundLabel} ━━`, BOLD, FG.brightCyan)}\n`);
         },
-        onParticipantStart: ({ target, roundLabel }) => {
+        onParticipantStart: ({ target, roundLabel, isRetry }) => {
           streamedAnyText = false;
           const modelStr = target.model ? style(` (${target.model})`, DIM) : "";
+          const retryStr = isRetry ? style(" (retry)", FG.brightGreen) : "";
           process.stderr.write(
-            `\n${agentBadge(target.agent, true)} ${style(`--${target.agent}`, DIM)}${modelStr} ${style(`[${roundLabel}]`, DIM, FG.cyan)}\n`,
+            `\n${agentBadge(target.agent, true)} ${style(`--${target.agent}`, DIM)}${modelStr} ${style(`[${roundLabel}]`, DIM, FG.cyan)}${retryStr}\n`,
           );
         },
         onParticipantEvent: ({ target, event }) => {
@@ -331,6 +361,36 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
       hadError = discResult.hadError;
       Object.assign(opts.session.agentSessions, discResult.sessionIds);
       assistantMessages.push(...discResult.messages);
+
+      if (!opts.onPermissionRequest) {
+        const missingDirs = new Set<string>();
+        let needsFull = false;
+        for (const msg of discResult.messages) {
+          const det = detectPermissionRequest({
+            text: msg.content,
+            error: msg.error,
+            cwd: opts.cwd,
+            alreadyAllowedDirs: effectiveAllowedDirs,
+            currentPerm: effectiveConfig.permissionMode,
+          });
+          if (det) {
+            for (const d of det.requestedDirs) missingDirs.add(d);
+            if (det.needsFullPerm) needsFull = true;
+          }
+        }
+        const suggestion = [
+          ...Array.from(missingDirs).map((d) => `--add-dir "${d}"`),
+          ...(needsFull ? ["--yolo"] : []),
+        ].join(" ");
+        if (suggestion) {
+          process.stderr.write(
+            style(
+              `\nHint: An agent requested extra permissions during discussion. Re-run with: ${suggestion}\n`,
+              FG.yellow,
+            ),
+          );
+        }
+      }
     } else {
       const multi = targets.length > 1;
       for (const target of targets) {
@@ -362,35 +422,101 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
         const tools: ToolEvent[] = [];
         let streamedAnyText = false;
 
-        const result = await adapter.run({
-          prompt: fullPrompt,
-          rawUserPrompt: opts.prompt,
-          history: historySnapshot,
-          sessionSummary: opts.session.summary,
-          summarizedUpTo: opts.session.summarizedUpTo,
-          transcriptPath,
-          skillsPromptBlock,
-          cwd: opts.cwd,
-          model: resolvedModel,
-          permissionMode: effectiveConfig.permissionMode,
-          sessionId: opts.session.agentSessions[agent],
-          config: agentConfig,
-          signal: controller.signal,
-          onEvent: (ev) => {
-            if (ev.type === "text" && ev.text) {
-              streamedAnyText = true;
-              process.stdout.write(ev.text);
-            } else if (ev.type === "tool" && ev.toolName && isTty) {
-              const detail = ev.toolDetail ? `: ${ev.toolDetail}` : "";
-              process.stderr.write(style(`  ⚙ ${ev.toolName}${detail}\n`, DIM, FG.cyan));
-            } else if (ev.type === "error" && ev.text) {
-              process.stderr.write(style(`\n[${agent} error] ${ev.text}\n`, FG.brightRed));
-            }
-          },
-        });
+        const runAdapterOnce = async (
+          allowedDirs: string[],
+          permMode: PermissionMode,
+          isRetry = false,
+        ) => {
+          if (isRetry) {
+            process.stderr.write(
+              `\n${agentBadge(agent, true)} ${style(`--${agent}`, DIM)}${resolvedModel ? style(` (${resolvedModel})`, DIM) : ""} ${style("(retry)", FG.brightGreen)}\n`,
+            );
+          }
+          streamedAnyText = false;
+          return adapter.run({
+            prompt: fullPrompt,
+            rawUserPrompt: opts.prompt,
+            history: historySnapshot,
+            sessionSummary: opts.session.summary,
+            summarizedUpTo: opts.session.summarizedUpTo,
+            transcriptPath,
+            skillsPromptBlock,
+            cwd: opts.cwd,
+            model: resolvedModel,
+            permissionMode: permMode,
+            allowedDirs,
+            sessionId: opts.session.agentSessions[agent],
+            config: agentConfig,
+            signal: controller.signal,
+            onEvent: (ev) => {
+              if (ev.type === "text" && ev.text) {
+                streamedAnyText = true;
+                process.stdout.write(ev.text);
+              } else if (ev.type === "tool" && ev.toolName && isTty) {
+                const detail = ev.toolDetail ? `: ${ev.toolDetail}` : "";
+                process.stderr.write(style(`  ⚙ ${ev.toolName}${detail}\n`, DIM, FG.cyan));
+              } else if (ev.type === "error" && ev.text) {
+                process.stderr.write(style(`\n[${agent} error] ${ev.text}\n`, FG.brightRed));
+              }
+            },
+          });
+        };
+
+        let result = await runAdapterOnce(effectiveAllowedDirs, effectiveConfig.permissionMode);
 
         if (streamedAnyText && !result.text.endsWith("\n")) {
           process.stdout.write("\n");
+        }
+
+        if (!controller.signal.aborted && !result.aborted) {
+          const detected = detectPermissionRequest({
+            text: result.text,
+            error: result.error,
+            cwd: opts.cwd,
+            alreadyAllowedDirs: effectiveAllowedDirs,
+            currentPerm: effectiveConfig.permissionMode,
+          });
+          if (detected) {
+            if (opts.onPermissionRequest) {
+              const decision = await opts.onPermissionRequest({
+                participantLabel: formatTargetLabel(target),
+                request: detected,
+              });
+              if (!controller.signal.aborted && decision !== "decline") {
+                const retryDirs = Array.from(
+                  new Set([...effectiveAllowedDirs, ...detected.requestedDirs]),
+                );
+                const retryPerm: PermissionMode =
+                  decision === "full" || detected.needsFullPerm
+                    ? "full"
+                    : effectiveConfig.permissionMode;
+                if (decision === "session" || decision === "full") {
+                  for (const d of detected.requestedDirs) {
+                    if (!effectiveAllowedDirs.includes(d)) effectiveAllowedDirs.push(d);
+                  }
+                  if (decision === "full" || detected.needsFullPerm) {
+                    effectiveConfig.permissionMode = "full";
+                  }
+                }
+                result = await runAdapterOnce(retryDirs, retryPerm, true);
+                if (streamedAnyText && !result.text.endsWith("\n")) {
+                  process.stdout.write("\n");
+                }
+              }
+            } else {
+              const dirFlags = detected.requestedDirs.map((d) => `--add-dir "${d}"`).join(" ");
+              const permFlag = detected.needsFullPerm ? "--yolo" : "";
+              const suggestion = [dirFlags, permFlag].filter(Boolean).join(" ");
+              if (suggestion) {
+                process.stderr.write(
+                  style(
+                    `\nHint: ${formatTargetLabel(target)} requested extra permissions (${detected.excerpt}). Re-run with: ${suggestion}\n`,
+                    FG.yellow,
+                  ),
+                );
+              }
+            }
+          }
         }
 
         if (result.sessionId) {
@@ -458,6 +584,7 @@ export interface PlainReplOptions {
   modelOverride?: string;
   agentModels?: Partial<Record<AgentId, string>>;
   permissionMode?: PermissionMode;
+  addDirs?: string[];
   agentDiscussion?: boolean;
   discussionRounds?: number;
 }
@@ -668,6 +795,43 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
           console.log(style(`Permission mode set to "${permissionMode}" (saved to ~/.mcli/config.json).`, FG.green));
         } else {
           console.log(style("Usage: /perm [read-only | edit | full]", FG.yellow));
+        }
+      } else if (cmd === "allow" || cmd === "add-dir" || cmd === "dirs") {
+        const trimmedArgs = args.trim();
+        const parts = trimmedArgs.split(/\s+/).filter(Boolean);
+        const sub = (parts[0] || "list").toLowerCase();
+        if (!trimmedArgs || sub === "list" || sub === "show") {
+          console.log(style("\nAllowed Directories (--add-dir):", BOLD));
+          console.log(`  Workspace (cwd): ${opts.cwd}`);
+          console.log(`  Session allowed: ${(opts.session.allowedDirs ?? []).join(", ") || "none"}`);
+          console.log(`  Config default:  ${(opts.config.allowedDirs ?? []).join(", ") || "none"}\n`);
+        } else if (sub === "clear") {
+          opts.session.allowedDirs = [];
+          saveSession(opts.session);
+          console.log(style("Cleared session-allowed directories.", FG.green));
+        } else if ((sub === "remove" || sub === "rm" || sub === "del") && parts.length >= 2) {
+          const norm = normalizeDirPath(trimmedArgs.replace(/^(?:remove|rm|del)\s+/i, ""), opts.cwd);
+          opts.session.allowedDirs = (opts.session.allowedDirs ?? []).filter(
+            (d) => normalizeDirPath(d, opts.cwd) !== norm,
+          );
+          saveSession(opts.session);
+          console.log(style(`Removed ${norm}`, FG.cyan));
+        } else {
+          const rawPath = sub === "add" && parts.length >= 2 ? trimmedArgs.replace(/^add\s+/i, "") : trimmedArgs;
+          const existing = resolveExistingDir(rawPath, opts.cwd);
+          const targetDir = existing ?? normalizeDirPath(rawPath, opts.cwd);
+          if (targetDir) {
+            opts.session.allowedDirs = Array.from(new Set([...(opts.session.allowedDirs ?? []), targetDir]));
+            saveSession(opts.session);
+            console.log(
+              style(
+                existing
+                  ? `Allowed directory for session: ${targetDir}`
+                  : `Added ${targetDir} (warning: path does not exist yet).`,
+                existing ? FG.green : FG.yellow,
+              ),
+            );
+          }
         }
       } else if (cmd === "discuss" || cmd === "discussion") {
         const parts = args.split(/\s+/).filter(Boolean);
@@ -881,10 +1045,53 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
       );
     }
 
+    const askApproval = async (info: {
+      participantLabel: string;
+      roundLabel?: string;
+      request: DetectedPermissionRequest;
+    }): Promise<PermissionApprovalDecision> => {
+      if (closed || !process.stdin.isTTY) return "decline";
+      console.log(
+        `\n${style("⚠ Permission Request", BOLD, FG.brightYellow)} — ${info.participantLabel}${info.roundLabel ? ` [${info.roundLabel}]` : ""}`,
+      );
+      console.log(`  Requested: ${info.request.excerpt}`);
+      if (info.request.requestedDirs.length > 0) {
+        console.log(`  Directory: ${info.request.requestedDirs.join(", ")}`);
+      }
+      if (info.request.needsFullPerm) {
+        console.log(`  Escalation: perm "${permissionMode}" → "full"`);
+      }
+      const answer = await new Promise<string>((resolve) => {
+        rl.question(
+          style("  [y] Approve once & retry / [a] Allow for session / [f] Allow + full perm / [N] Decline: ", FG.brightCyan),
+          (ans) => resolve(ans.trim().toLowerCase()),
+        );
+      });
+      if (answer === "y" || answer === "yes") return "once";
+      if (answer === "a" || answer === "always" || answer === "session") {
+        opts.session.allowedDirs = Array.from(
+          new Set([...(opts.session.allowedDirs ?? []), ...info.request.requestedDirs]),
+        );
+        if (info.request.needsFullPerm) permissionMode = "full";
+        saveSession(opts.session);
+        return "session";
+      }
+      if (answer === "f" || answer === "full") {
+        opts.session.allowedDirs = Array.from(
+          new Set([...(opts.session.allowedDirs ?? []), ...info.request.requestedDirs]),
+        );
+        permissionMode = "full";
+        saveSession(opts.session);
+        return "full";
+      }
+      return "decline";
+    };
+
     await runOneShot({
       agents: targets.map((t) => t.agent),
       targets,
       skills: parsed.skills,
+      addDirs: parsed.addDirs,
       prompt: parsed.prompt,
       config: { ...opts.config, shareContext, permissionMode, agentDiscussion, discussionRounds },
       session: opts.session,
@@ -894,6 +1101,7 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
       discussionRounds: parsed.discussionRounds ?? discussionRounds,
       synthesize: !parsed.noSynthesis,
       saveToSession: true,
+      onPermissionRequest: askApproval,
     });
   }
 

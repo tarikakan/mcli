@@ -1,4 +1,5 @@
 import { resolveBinary } from "../config.ts";
+import { filterExistingDirs } from "../permissions.ts";
 import type { AgentAdapter, AgentAvailability, AgentConfig, AgentRunResult, RunAgentOptions } from "../types.ts";
 import { expandArgTemplate, runCliProcess } from "./process.ts";
 
@@ -63,6 +64,11 @@ export const agyAdapter: AgentAdapter = {
           args.push("--mode", "accept-edits");
         } else if (opts.permissionMode === "full") {
           args.push("--dangerously-skip-permissions");
+        }
+      }
+      if (opts.allowedDirs?.length) {
+        for (const dir of filterExistingDirs(opts.allowedDirs, opts.cwd)) {
+          args.push("--add-dir", dir);
         }
       }
       if (extra.length) {

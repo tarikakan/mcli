@@ -1,4 +1,5 @@
 import { resolveBinary } from "../config.ts";
+import { filterExistingDirs } from "../permissions.ts";
 import type { AgentAdapter, AgentAvailability, AgentConfig, AgentRunResult, RunAgentOptions } from "../types.ts";
 import { expandArgTemplate, runCliProcess } from "./process.ts";
 
@@ -63,6 +64,11 @@ export const claudeAdapter: AgentAdapter = {
           args.push("--permission-mode", "acceptEdits");
         } else if (opts.permissionMode === "full") {
           args.push("--permission-mode", "bypassPermissions");
+        }
+      }
+      if (opts.allowedDirs?.length) {
+        for (const dir of filterExistingDirs(opts.allowedDirs, opts.cwd)) {
+          args.push("--add-dir", dir);
         }
       }
       if (extra.length) {

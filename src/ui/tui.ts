@@ -4,6 +4,7 @@ import { detectAllAgents, getAdapter } from "../adapters/index.ts";
 import { isAgentId, parseInlineInput, parsePermissionModeValue } from "../cli-args.ts";
 import { getConfigPath, saveConfig } from "../config.ts";
 import { runAgentDiscussion } from "../discussion.ts";
+import type { PermissionApprovalDecision } from "../discussion.ts";
 import {
   getEffectiveContextConfig,
   resolveMemoryScribe,
@@ -17,6 +18,12 @@ import {
   resolveModelAlias,
 } from "../models.ts";
 import type { ModelOption } from "../models.ts";
+import {
+  detectPermissionRequest,
+  normalizeDirPath,
+  resolveExistingDir,
+} from "../permissions.ts";
+import type { DetectedPermissionRequest } from "../permissions.ts";
 import {
   buildPromptWithContext,
   buildSharedContextBlock,
@@ -79,6 +86,7 @@ const SLASH_COMMANDS = [
   "/status",
   "/agents",
   "/perm",
+  "/allow",
   "/skills",
   "/skill",
   "/clear",
@@ -180,6 +188,7 @@ export interface TuiOptions {
   modelOverride?: string;
   agentModels?: Partial<Record<AgentId, string>>;
   permissionMode?: PermissionMode;
+  addDirs?: string[];
   agentDiscussion?: boolean;
   discussionRounds?: number;
 }
@@ -188,6 +197,14 @@ interface ModelPickerState {
   agent: AgentId;
   items: Array<{ id?: string; label: string; note?: string }>;
   selectedIndex: number;
+}
+
+interface PendingApprovalState {
+  agent: AgentId;
+  participantLabel: string;
+  roundLabel?: string;
+  request: DetectedPermissionRequest;
+  resolve: (decision: PermissionApprovalDecision) => void;
 }
 
 export class UnifiedChatTui {
@@ -245,6 +262,7 @@ export class UnifiedChatTui {
   private memoryCompacting = false;
   private availableSkills: SkillInfo[] = [];
   private modelPicker: ModelPickerState | null = null;
+  private pendingApproval: PendingApprovalState | null = null;
   private renderScheduled = false;
   private running = false;
   private resolveExit: (() => void) | null = null;
@@ -260,6 +278,12 @@ export class UnifiedChatTui {
     this.discussionRounds = opts.discussionRounds ?? opts.config.discussionRounds;
     this.availability = detectAllAgents(opts.config);
     this.availableSkills = discoverSkills(opts.cwd, opts.config);
+    if (opts.addDirs && opts.addDirs.length > 0) {
+      const normalized = opts.addDirs.map((d) => normalizeDirPath(d, opts.cwd)).filter(Boolean);
+      this.session.allowedDirs = Array.from(
+        new Set([...(this.session.allowedDirs ?? []), ...normalized]),
+      );
+    }
     if (opts.agentModels) {
       this.modelOverrides = { ...opts.agentModels };
     }
@@ -533,6 +557,11 @@ export class UnifiedChatTui {
   private shutdown(): void {
     if (!this.running) return;
     this.running = false;
+    if (this.pendingApproval) {
+      const resolvePending = this.pendingApproval.resolve;
+      this.pendingApproval = null;
+      resolvePending("decline");
+    }
     if (this.activeController) {
       this.activeController.abort();
       this.activeController = null;
@@ -625,7 +654,7 @@ export class UnifiedChatTui {
       const partial = prefix.slice(lead.length).toLowerCase();
       const candidates =
         lead === "--"
-          ? [...AGENT_IDS, "models", "model", "skills", "skill", "perm", "yolo", "read-only", "discuss", "agent-discussion", "rounds"]
+          ? [...AGENT_IDS, "models", "model", "skills", "skill", "perm", "yolo", "read-only", "add-dir", "allow-dir", "discuss", "agent-discussion", "rounds"]
           : [...AGENT_IDS];
       const matched = candidates.find((id) => id.startsWith(partial) && id !== partial);
       if (matched) {
@@ -806,7 +835,135 @@ export class UnifiedChatTui {
     }
   }
 
+  private getEffectiveAllowedDirs(extraDirs: string[] = []): string[] {
+    const combined = [
+      ...(this.config.allowedDirs ?? []),
+      ...(this.session.allowedDirs ?? []),
+      ...extraDirs,
+    ];
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const d of combined) {
+      const norm = normalizeDirPath(d, this.cwd);
+      if (norm && !seen.has(norm)) {
+        seen.add(norm);
+        out.push(norm);
+      }
+    }
+    return out;
+  }
+
+  private grantSessionDirs(dirs: string[]): void {
+    const current = new Set(this.session.allowedDirs ?? []);
+    for (const d of dirs) {
+      const norm = normalizeDirPath(d, this.cwd);
+      if (norm) current.add(norm);
+    }
+    this.session.allowedDirs = Array.from(current);
+    saveSession(this.session);
+  }
+
+  private requestPermissionApproval(info: {
+    agent: AgentId;
+    participantLabel: string;
+    roundLabel?: string;
+    request: DetectedPermissionRequest;
+  }): Promise<PermissionApprovalDecision> {
+    return new Promise((resolve) => {
+      this.pendingApproval = {
+        agent: info.agent,
+        participantLabel: info.participantLabel,
+        roundLabel: info.roundLabel,
+        request: info.request,
+        resolve: (decision) => {
+          this.pendingApproval = null;
+          if (decision === "session" || decision === "full") {
+            if (info.request.requestedDirs.length > 0) {
+              this.grantSessionDirs(info.request.requestedDirs);
+            }
+            if (decision === "full" || info.request.needsFullPerm) {
+              this.permissionMode = "full";
+            }
+          }
+          if (decision === "decline") {
+            this.setNotice(`Declined permission request for ${info.participantLabel}.`, 3000);
+          } else {
+            const scope =
+              decision === "once"
+                ? "once"
+                : decision === "full"
+                  ? "session + perm=full"
+                  : "session";
+            this.setNotice(`Approved (${scope}) — retrying ${info.participantLabel}…`, 3500);
+          }
+          this.scheduleRender();
+          resolve(decision);
+        },
+      };
+      this.scrollOffset = 0;
+      if (process.stdout.isTTY) {
+        process.stdout.write("\x07");
+      }
+      this.scheduleRender();
+    });
+  }
+
+  private handleApprovalChunk(chunk: string): void {
+    if (!this.pendingApproval) return;
+
+    // Allow mouse wheel scrolling while reading the blocked response above the prompt
+    if (parseMouseSequence(chunk)) {
+      let i = 0;
+      while (i < chunk.length) {
+        const mouse = parseMouseSequence(chunk.slice(i));
+        if (!mouse) break;
+        if (mouse.wheel === "up") this.scrollChat(3);
+        else if (mouse.wheel === "down") this.scrollChat(-3);
+        i += mouse.length;
+      }
+      return;
+    }
+
+    if (chunk === "\x1b[5~") {
+      this.scrollChat(Math.max(4, Math.floor(this.lastViewportHeight * 0.75)));
+      return;
+    }
+    if (chunk === "\x1b[6~") {
+      this.scrollChat(-Math.max(4, Math.floor(this.lastViewportHeight * 0.75)));
+      return;
+    }
+
+    const resolve = this.pendingApproval.resolve;
+    if (chunk === "y" || chunk === "Y" || chunk === "\r" || chunk === "\n") {
+      resolve("once");
+      return;
+    }
+    if (chunk === "a" || chunk === "A") {
+      resolve("session");
+      return;
+    }
+    if (chunk === "f" || chunk === "F") {
+      resolve("full");
+      return;
+    }
+    if (chunk === "n" || chunk === "N" || chunk === "\x1b") {
+      resolve("decline");
+      return;
+    }
+    if (chunk === "\x03") {
+      resolve("decline");
+      if (this.activeController) {
+        this.activeController.abort();
+      }
+      return;
+    }
+  }
+
   private handleInputChunk(chunk: string): void {
+    if (this.pendingApproval) {
+      this.handleApprovalChunk(chunk);
+      return;
+    }
     if (this.modelPicker) {
       this.handleModelPickerChunk(chunk);
       return;
@@ -1290,6 +1447,7 @@ export class UnifiedChatTui {
       synthesize: !parsed.noSynthesis,
       skills: parsed.skills,
       permissionMode: parsed.permissionMode ?? this.permissionMode,
+      addDirs: parsed.addDirs,
     });
   }
 
@@ -1324,6 +1482,7 @@ export class UnifiedChatTui {
             "",
             "**Slash Commands:**",
             "- `/perm [read-only|edit|full]` — control headless tool permissions across all CLIs (`edit` allows file writes; `full`/`--yolo` also allows shell commands like `cp`, `pdflatex`, `npm test`)",
+            "- `/allow [list|<dir>|remove <dir>|clear]` — grant read/write access to external directories outside cwd (passed as `--add-dir` to Claude, Codex & Agy); agents requesting external paths mid-discussion also trigger a live `[Y]/[A]/[N]` approval prompt",
             "- `/skills` or `--skills` — list all skills from Claude, Codex, Agy, Kimi & workspace",
             "- `/skill [use <name>|off <name>|clear|show <name>]` — pin/unpin or inspect skills across all agents (or use `--skill <name>` / `$<name>` per turn)",
             "- `/discuss [on|off|rounds <N>]` — toggle default multi-agent discussion mode",
@@ -1373,6 +1532,71 @@ export class UnifiedChatTui {
           return;
         }
         this.setNotice("Usage: /perm [read-only | edit | full]");
+        return;
+      }
+
+      case "allow":
+      case "add-dir":
+      case "dirs": {
+        const trimmed = args.trim();
+        const parts = trimmed.split(/\s+/).filter(Boolean);
+        const sub = (parts[0] || "list").toLowerCase();
+
+        if (!trimmed || sub === "list" || sub === "show") {
+          const sessDirs = this.session.allowedDirs ?? [];
+          const cfgDirs = this.config.allowedDirs ?? [];
+          const lines = [
+            "**Allowed Directories (`--add-dir` across Claude, Codex & Agy):**",
+            "",
+            `- **Workspace (cwd):** \`${this.cwd}\``,
+            `- **Session allowed:** ${sessDirs.length > 0 ? sessDirs.map((d) => `\`${d}\``).join(", ") : "*none*"}`,
+            `- **Config default (\`~/.mcli/config.json\`):** ${cfgDirs.length > 0 ? cfgDirs.map((d) => `\`${d}\``).join(", ") : "*none*"}`,
+            "",
+            "Use `/allow /path/to/dir` to grant access for this session, `/allow remove /path`, `/allow clear`, or `--add-dir /path` per prompt.",
+          ];
+          this.addSystemMessage(lines.join("\n"));
+          return;
+        }
+
+        if (sub === "clear") {
+          this.session.allowedDirs = [];
+          saveSession(this.session);
+          this.setNotice("Cleared all session-allowed external directories.");
+          return;
+        }
+
+        if ((sub === "remove" || sub === "rm" || sub === "del") && parts.length >= 2) {
+          const rawTarget = trimmed.replace(/^(?:remove|rm|del)\s+/i, "");
+          const norm = normalizeDirPath(rawTarget, this.cwd);
+          const before = (this.session.allowedDirs ?? []).length;
+          this.session.allowedDirs = (this.session.allowedDirs ?? []).filter(
+            (d) => normalizeDirPath(d, this.cwd) !== norm,
+          );
+          saveSession(this.session);
+          if (this.session.allowedDirs.length < before) {
+            this.setNotice(`Removed allowed directory: ${norm}`);
+          } else {
+            this.setNotice(`Directory not in session allowlist: ${norm}`);
+          }
+          return;
+        }
+
+        const rawPath = sub === "add" && parts.length >= 2 ? trimmed.replace(/^add\s+/i, "") : trimmed;
+        const existing = resolveExistingDir(rawPath, this.cwd);
+        const targetDir = existing ?? normalizeDirPath(rawPath, this.cwd);
+        if (!targetDir) {
+          this.setNotice("Usage: /allow [list | <dir> | remove <dir> | clear]");
+          return;
+        }
+        this.grantSessionDirs([targetDir]);
+        if (existing) {
+          this.setNotice(`Allowed directory for this session: ${targetDir}`, 4000);
+        } else {
+          this.setNotice(
+            `Added ${targetDir} (warning: path not found on disk yet — will apply once mounted/created).`,
+            5000,
+          );
+        }
         return;
       }
 
@@ -1856,10 +2080,12 @@ export class UnifiedChatTui {
       synthesize: boolean;
       skills?: string[];
       permissionMode?: PermissionMode;
+      addDirs?: string[];
     },
   ): Promise<void> {
     const historySnapshot = [...this.session.messages];
     const transcriptPath = getSessionTranscriptPath(this.session.id);
+    const turnAllowedDirs = this.getEffectiveAllowedDirs(discussionOpts.addDirs ?? []);
 
     // Resolve pinned + per-turn skills across all CLI skill directories
     const requestedSkillNames = Array.from(
@@ -1920,12 +2146,13 @@ export class UnifiedChatTui {
     try {
       if (discussionOpts.discuss && targets.length >= 2) {
         let roundCommittedCount = 0;
-        let currentRoundMessages: ChatMessage[] = [];
+        let currentRoundMessages: Array<ChatMessage | undefined> = [];
 
         const commitFinishedRound = (): void => {
-          if (currentRoundMessages.length > 0) {
-            this.session.messages.push(...currentRoundMessages);
-            roundCommittedCount += currentRoundMessages.length;
+          const ready = currentRoundMessages.filter((m): m is ChatMessage => m !== undefined);
+          if (ready.length > 0) {
+            this.session.messages.push(...ready);
+            roundCommittedCount += ready.length;
             currentRoundMessages = [];
           }
         };
@@ -1938,6 +2165,7 @@ export class UnifiedChatTui {
           summarizedUpTo: this.session.summarizedUpTo,
           transcriptPath,
           skills: activeSkills,
+          allowedDirs: turnAllowedDirs,
           cwd: this.cwd,
           config: effectiveConfig,
           rounds: discussionOpts.rounds,
@@ -1946,6 +2174,7 @@ export class UnifiedChatTui {
           parallel: true,
           onRoundStart: ({ roundLabel, participants }) => {
             commitFinishedRound();
+            currentRoundMessages = new Array(participants.length);
             this.liveStreams = participants.map((t) => ({
               agent: t.agent,
               model: t.model ?? this.config.agents[t.agent]?.model,
@@ -1957,6 +2186,21 @@ export class UnifiedChatTui {
               done: false,
             }));
             this.scheduleRender();
+          },
+          onParticipantStart: ({ index, target, roundLabel, isRetry }) => {
+            if (isRetry && this.liveStreams[index]) {
+              this.liveStreams[index] = {
+                agent: target.agent,
+                model: target.model ?? this.config.agents[target.agent]?.model,
+                roundLabel: `${roundLabel} · retry`,
+                text: "",
+                reasoning: "",
+                tools: [],
+                startedAt: Date.now(),
+                done: false,
+              };
+              this.scheduleRender();
+            }
           },
           onParticipantEvent: ({ index, event }) => {
             const stream = this.liveStreams[index];
@@ -1976,7 +2220,7 @@ export class UnifiedChatTui {
             const stream = this.liveStreams[index];
             if (stream) stream.done = true;
             const agentConfig = this.config.agents[target.agent] ?? {};
-            currentRoundMessages.push({
+            currentRoundMessages[index] = {
               id: createMessageId(),
               role: "assistant",
               agent: target.agent,
@@ -1989,8 +2233,16 @@ export class UnifiedChatTui {
               durationMs: result.durationMs,
               error: result.error,
               aborted: result.aborted,
-            });
+            };
             this.scheduleRender();
+          },
+          onPermissionRequest: async ({ target, participantLabel, roundLabel, request }) => {
+            return this.requestPermissionApproval({
+              agent: target.agent,
+              participantLabel,
+              roundLabel,
+              request,
+            });
           },
         });
 
@@ -2000,18 +2252,6 @@ export class UnifiedChatTui {
           this.session.messages.push(...discResult.messages);
         }
         saveSession(this.session);
-
-        if (
-          activePerm !== "full" &&
-          discResult.messages.some((m) =>
-            /permission wasn't granted|was blocked|not permitted|requires? approval/i.test(m.content),
-          )
-        ) {
-          this.setNotice(
-            `Hint: A tool/shell call was blocked under perm="${activePerm}". Run /perm full (or add --yolo) to allow shell commands too.`,
-            6000,
-          );
-        }
       } else {
         this.liveStreams = targets.map((t) => ({
           agent: t.agent,
@@ -2024,62 +2264,128 @@ export class UnifiedChatTui {
         }));
         this.scheduleRender();
 
-        const results = await Promise.all(
-          targets.map(async (target, idx) => {
-            const stream = this.liveStreams[idx];
-            const adapter = getAdapter(target.agent);
-            const agentConfig = this.config.agents[target.agent] ?? {};
+        const runSingleTarget = async (
+          target: AgentTarget,
+          idx: number,
+          allowedDirs: string[],
+          permMode: PermissionMode,
+          isRetry = false,
+        ) => {
+          if (isRetry) {
+            this.liveStreams[idx] = {
+              agent: target.agent,
+              model: target.model ?? this.config.agents[target.agent]?.model,
+              roundLabel: "retry",
+              text: "",
+              reasoning: "",
+              tools: [],
+              startedAt: Date.now(),
+              done: false,
+            };
+            this.scheduleRender();
+          }
+          const stream = this.liveStreams[idx];
+          const adapter = getAdapter(target.agent);
+          const agentConfig = this.config.agents[target.agent] ?? {};
 
-            const fullPrompt = prependSkillsToPrompt(
-              buildPromptWithContext({
-                userPrompt,
-                history: historySnapshot,
-                targetAgent: target.agent,
-                config: effectiveConfig,
-                sessionSummary: this.session.summary,
-                summarizedUpTo: this.session.summarizedUpTo,
-                transcriptPath,
-              }),
-              activeSkills,
-            );
-
-            const res = await adapter.run({
-              prompt: fullPrompt,
-              rawUserPrompt: userPrompt,
+          const fullPrompt = prependSkillsToPrompt(
+            buildPromptWithContext({
+              userPrompt,
               history: historySnapshot,
+              targetAgent: target.agent,
+              config: effectiveConfig,
               sessionSummary: this.session.summary,
               summarizedUpTo: this.session.summarizedUpTo,
               transcriptPath,
-              skillsPromptBlock,
-              cwd: this.cwd,
-              model: target.model,
-              permissionMode: activePerm,
-              sessionId: this.session.agentSessions[target.agent],
-              config: agentConfig,
-              signal: controller.signal,
-              onEvent: (ev) => {
-                if (ev.type === "text" && ev.text) {
-                  stream.text += ev.text;
-                } else if (ev.type === "reasoning" && ev.text) {
-                  stream.reasoning += ev.text;
-                } else if (ev.type === "tool" && ev.toolName) {
-                  stream.tools.push({ name: ev.toolName, detail: ev.toolDetail });
-                } else if (ev.type === "error" && ev.text) {
-                  stream.error = ev.text;
-                }
-                this.scheduleRender();
-              },
-            });
+            }),
+            activeSkills,
+          );
 
-            stream.done = true;
-            if (res.sessionId) {
-              this.session.agentSessions[target.agent] = res.sessionId;
-            }
-            this.scheduleRender();
+          const res = await adapter.run({
+            prompt: fullPrompt,
+            rawUserPrompt: userPrompt,
+            history: historySnapshot,
+            sessionSummary: this.session.summary,
+            summarizedUpTo: this.session.summarizedUpTo,
+            transcriptPath,
+            skillsPromptBlock,
+            cwd: this.cwd,
+            model: target.model,
+            permissionMode: permMode,
+            allowedDirs,
+            sessionId: this.session.agentSessions[target.agent],
+            config: agentConfig,
+            signal: controller.signal,
+            onEvent: (ev) => {
+              if (ev.type === "text" && ev.text) {
+                stream.text += ev.text;
+              } else if (ev.type === "reasoning" && ev.text) {
+                stream.reasoning += ev.text;
+              } else if (ev.type === "tool" && ev.toolName) {
+                stream.tools.push({ name: ev.toolName, detail: ev.toolDetail });
+              } else if (ev.type === "error" && ev.text) {
+                stream.error = ev.text;
+              }
+              this.scheduleRender();
+            },
+          });
 
-            return { target, res };
-          }),
+          stream.done = true;
+          if (res.sessionId) {
+            this.session.agentSessions[target.agent] = res.sessionId;
+          }
+          this.scheduleRender();
+
+          return { target, res };
+        };
+
+        const results = await Promise.all(
+          targets.map((target, idx) => runSingleTarget(target, idx, turnAllowedDirs, activePerm)),
         );
+
+        // Check for blocked external dir / shell permission requests and offer interactive approval + retry
+        const sessionApprovedDirs = [...turnAllowedDirs];
+        let sessionApprovedPerm: PermissionMode = activePerm;
+        for (let idx = 0; idx < results.length; idx++) {
+          if (controller.signal.aborted || results[idx].res.aborted) continue;
+          const detected = detectPermissionRequest({
+            text: results[idx].res.text,
+            error: results[idx].res.error,
+            cwd: this.cwd,
+            alreadyAllowedDirs: turnAllowedDirs,
+            currentPerm: activePerm,
+          });
+          if (!detected) continue;
+
+          const alreadyCovered =
+            detected.requestedDirs.every((d) => sessionApprovedDirs.includes(d)) &&
+            (!detected.needsFullPerm || sessionApprovedPerm === "full");
+
+          const decision = alreadyCovered
+            ? "session"
+            : await this.requestPermissionApproval({
+                agent: results[idx].target.agent,
+                participantLabel: formatTargetLabel(results[idx].target),
+                request: detected,
+              });
+
+          if (controller.signal.aborted || decision === "decline") continue;
+
+          const retryDirs = Array.from(new Set([...sessionApprovedDirs, ...detected.requestedDirs]));
+          const retryPerm: PermissionMode =
+            decision === "full" || detected.needsFullPerm ? "full" : sessionApprovedPerm;
+
+          if (decision === "session" || decision === "full") {
+            for (const d of detected.requestedDirs) {
+              if (!sessionApprovedDirs.includes(d)) sessionApprovedDirs.push(d);
+            }
+            if (decision === "full" || detected.needsFullPerm) {
+              sessionApprovedPerm = "full";
+            }
+          }
+
+          results[idx] = await runSingleTarget(results[idx].target, idx, retryDirs, retryPerm, true);
+        }
 
         for (const { target, res } of results) {
           const agentConfig = this.config.agents[target.agent] ?? {};
@@ -2099,17 +2405,6 @@ export class UnifiedChatTui {
         }
 
         saveSession(this.session);
-
-        // If an agent mentioned blocked permissions while not in full mode, surface an actionable hint
-        if (
-          activePerm !== "full" &&
-          results.some(({ res }) => /permission wasn't granted|was blocked|not permitted|requires? approval/i.test(res.text))
-        ) {
-          this.setNotice(
-            `Hint: A tool/shell call was blocked under perm="${activePerm}". Run /perm full (or add --yolo) to allow shell commands too.`,
-            6000,
-          );
-        }
       }
     } finally {
       if (this.spinnerTimer) {
@@ -2173,13 +2468,15 @@ export class UnifiedChatTui {
     const activeModel = this.modelOverrides[this.activeAgent] ?? this.config.agents[this.activeAgent]?.model;
     const modelPart = activeModel ? `  •  model: ${activeModel}` : "  •  model: default";
     const permPart = `  •  perm: ${this.permissionMode}`;
+    const allowedCount = this.getEffectiveAllowedDirs().length;
+    const dirsPart = allowedCount > 0 ? `  •  dirs: +${allowedCount}` : "";
     const discPart = this.agentDiscussion ? `  •  discuss: on (${this.discussionRounds}r)` : "";
     const pinnedSkills = this.session.pinnedSkills ?? [];
     const skillPart = pinnedSkills.length > 0 ? `  •  skills: ${pinnedSkills.join(",")}` : "";
     const ctxPart = `context: ${this.shareContext ? "on" : "off"} (${msgCount} msgs)`;
     const row2 = truncateVisible(
       style(
-        ` dir: ${dirName}  •  session: ${this.session.name}  •  ${ctxPart}${modelPart}${permPart}${discPart}${skillPart}  •  /help`,
+        ` dir: ${dirName}  •  session: ${this.session.name}  •  ${ctxPart}${modelPart}${permPart}${dirsPart}${discPart}${skillPart}  •  /help`,
         DIM,
       ),
       cols,
@@ -2402,6 +2699,56 @@ export class UnifiedChatTui {
     return lines;
   }
 
+  private buildApprovalBannerLines(cols: number): string[] {
+    if (!this.pendingApproval) return [];
+    const { participantLabel, roundLabel, request } = this.pendingApproval;
+    const boxWidth = Math.max(36, cols - 2);
+    const innerWidth = boxWidth - 4;
+    const titlePlain = ` ⚠ Permission Request · ${participantLabel}${roundLabel ? ` [${roundLabel}]` : ""} `;
+    const fillLen = Math.max(2, boxWidth - 3 - titlePlain.length);
+    const topBorder =
+      " " +
+      style("╭─", FG.brightYellow, BOLD) +
+      style(truncateVisible(titlePlain, boxWidth - 5), FG.brightYellow, BOLD) +
+      style("─".repeat(fillLen) + "╮", FG.brightYellow, BOLD);
+    const bottomBorder = " " + style(`╰${"─".repeat(Math.max(2, boxWidth - 2))}╯`, FG.brightYellow, BOLD);
+
+    const frameLine = (content: string): string => {
+      const padded = padRightVisible(truncateVisible(content, innerWidth), innerWidth);
+      return ` ${style("│", FG.brightYellow, BOLD)} ${padded} ${style("│", FG.brightYellow, BOLD)}`;
+    };
+
+    const lines: string[] = [topBorder];
+    lines.push(
+      frameLine(`${style("Requested:", BOLD, FG.brightWhite)} ${style(request.excerpt, FG.white)}`),
+    );
+    if (request.requestedDirs.length > 0) {
+      lines.push(
+        frameLine(
+          `${style("Add directory:", BOLD, FG.brightCyan)} ${style(request.requestedDirs.join(", "), FG.brightWhite)}`,
+        ),
+      );
+    }
+    if (request.needsFullPerm) {
+      lines.push(
+        frameLine(
+          `${style("Escalation:", BOLD, FG.brightYellow)} ${style(`perm "${this.permissionMode}" → "full" (allows shell commands)`, FG.yellow)}`,
+        ),
+      );
+    }
+    const actions = [
+      `${BG.green}${FG.black}${BOLD} Y ${RESET}${style(" Approve once & retry", FG.brightGreen)}`,
+      `${BG.cyan}${FG.black}${BOLD} A ${RESET}${style(" Allow for session", FG.brightCyan)}`,
+      ...(request.needsFullPerm || this.permissionMode === "full"
+        ? []
+        : [`${BG.yellow}${FG.black}${BOLD} F ${RESET}${style(" Allow + full perm", FG.yellow)}`]),
+      `${BG.darkGray}${FG.brightWhite}${BOLD} N ${RESET}${style(" Decline", DIM)}`,
+    ].join("   ");
+    lines.push(frameLine(actions));
+    lines.push(bottomBorder);
+    return lines;
+  }
+
   private styleInputLine(raw: string): string {
     // Highlight /commands, --agent[:model] / --agent --<model>, and --discuss / --agent discussion anywhere in the line
     if (raw.startsWith("/")) {
@@ -2411,7 +2758,7 @@ export class UnifiedChatTui {
     }
 
     let out = raw.replace(
-      /(^|\s)(--agent\s+discussion|--agent-discussion|--discuss(?:ion)?|--no-discuss(?:ion)?|--debate|--models|--skills|--skill(?:=\S+|\s+\S+)?|--perm(?:issions?)?(?:=\S+|\s+\S+)?|--yolo|--full-auto|--read-only|--allow-edits|--no-synthesis|--rounds(?:=\d+|\s+\d+)?)(?=\s|$)/gi,
+      /(^|\s)(--agent\s+discussion|--agent-discussion|--discuss(?:ion)?|--no-discuss(?:ion)?|--debate|--models|--skills|--skill(?:=\S+|\s+\S+)?|--perm(?:issions?)?(?:=\S+|\s+\S+)?|--yolo|--full-auto|--read-only|--allow-edits|--add-dir(?:=\S+|\s+\S+)?|--allow-dir(?:=\S+|\s+\S+)?|--no-synthesis|--rounds(?:=\d+|\s+\d+)?)(?=\s|$)/gi,
       (_m, lead: string, flag: string) => `${lead}${style(flag, FG.brightCyan, BOLD)}`,
     );
 
@@ -2438,7 +2785,8 @@ export class UnifiedChatTui {
 
     const headerLines = this.buildHeaderLines(cols); // 3 rows
     this.lastHeaderHeight = headerLines.length;
-    const footerHeight = 3; // divider + input + hint
+    const approvalLines = this.pendingApproval ? this.buildApprovalBannerLines(cols) : [];
+    const footerHeight = 3 + approvalLines.length; // optional approval banner + divider + input + hint
     const viewportHeight = Math.max(4, rows - headerLines.length - footerHeight);
     this.lastViewportHeight = viewportHeight;
 
@@ -2480,13 +2828,15 @@ export class UnifiedChatTui {
     }
 
     // Footer divider with status indicator on the right
-    const statusRight = this.modelPicker
-      ? style(` Selecting model for --${this.modelPicker.agent} `, agentFg(this.modelPicker.agent))
-      : this.activeController
-        ? style(" Streaming… (Ctrl+C / Esc to cancel) ", FG.brightYellow)
-        : this.scrollOffset > 0
-          ? style(` ↑ Scrolled +${this.scrollOffset}L (PgDn to jump down) `, FG.brightCyan)
-          : style(` Ready · --${this.activeAgent} `, agentFg(this.activeAgent));
+    const statusRight = this.pendingApproval
+      ? style(" ⚠ Approval Required — press Y / A / N ", FG.brightYellow, BOLD)
+      : this.modelPicker
+        ? style(` Selecting model for --${this.modelPicker.agent} `, agentFg(this.modelPicker.agent))
+        : this.activeController
+          ? style(" Streaming… (Ctrl+C / Esc to cancel) ", FG.brightYellow)
+          : this.scrollOffset > 0
+            ? style(` ↑ Scrolled +${this.scrollOffset}L (PgDn to jump down) `, FG.brightCyan)
+            : style(` Ready · --${this.activeAgent} `, agentFg(this.activeAgent));
     const statusLen = stripAnsi(statusRight).length;
     const leftRule = Math.max(2, cols - statusLen);
     const footerDivider = style("─".repeat(leftRule), DIM, FG.gray) + statusRight;
@@ -2517,7 +2867,12 @@ export class UnifiedChatTui {
     // Hint / notice bar
     const now = Date.now();
     let hintText: string;
-    if (this.modelPicker) {
+    if (this.pendingApproval) {
+      hintText = style(
+        " Y/Enter: approve once & retry  •  A: allow for session  •  F: allow + full perm  •  N/Esc: decline  •  Wheel/PgUp: scroll",
+        FG.brightYellow,
+      );
+    } else if (this.modelPicker) {
       hintText = style(
         " ↑/↓: move  •  Tab/←/→: agent  •  Enter: apply  •  S: save default  •  Esc: close",
         FG.brightCyan,
@@ -2537,6 +2892,7 @@ export class UnifiedChatTui {
     const frameRows = [
       ...headerLines,
       ...visibleLines.map((l) => padRightVisible(l, cols)),
+      ...approvalLines.map((l) => padRightVisible(l, cols)),
       footerDivider,
       inputRow,
       hintRow,
@@ -2548,10 +2904,10 @@ export class UnifiedChatTui {
       out += `\x1b[${r + 1};1H\x1b[2K${frameRows[r]}`;
     }
 
-    // Position real terminal cursor inside the input row (hide while model picker is open)
-    const inputRowIndex = headerLines.length + viewportHeight + 2; // 1-based row
+    // Position real terminal cursor inside the input row (hide while model picker or approval modal is open)
+    const inputRowIndex = headerLines.length + viewportHeight + approvalLines.length + 2; // 1-based row
     this.lastInputRowIndex = inputRowIndex;
-    if (!this.modelPicker) {
+    if (!this.modelPicker && !this.pendingApproval) {
       const cursorCol = Math.min(cols, prefixPlain.length + (this.cursor - windowStart) + 1);
       out += `\x1b[${inputRowIndex};${cursorCol}H\x1b[?25h`;
     }

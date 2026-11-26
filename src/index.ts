@@ -2,6 +2,7 @@ import { detectAllAgents, pickInitialAgent } from "./adapters/index.ts";
 import { parseCliArgs } from "./cli-args.ts";
 import { createDefaultConfig, getConfigPath, loadConfig, saveConfig } from "./config.ts";
 import { resolveModelAlias } from "./models.ts";
+import { normalizeDirPath } from "./permissions.ts";
 import { loadOrCreateSession } from "./session.ts";
 import { AGENT_IDS } from "./types.ts";
 import type { AgentId, AgentTarget } from "./types.ts";
@@ -47,6 +48,7 @@ function printHelp(): void {
     "  --skill <name>         Apply any CLI's skill to any agent (repeatable; or inline $<name>)",
     "  --perm <mode>          Headless permissions: read-only | edit (default) | full (--yolo)",
     "  --yolo, --full-auto    Shorthand for --perm full (auto-approve edits + shell commands)",
+    "  --add-dir <dir>        Grant read/write access to an extra directory outside cwd (repeatable)",
     "  --discuss, --agent discussion  Enable multi-round peer discussion + synthesis across 2+ agents",
     "  --rounds <N>           Number of discussion rounds (default: 2, max: 6)",
     "  --no-synthesis         Skip final consensus synthesis step after discussion rounds",
@@ -169,6 +171,7 @@ export async function main(argv: string[]): Promise<void> {
       agents: resolvedTargets.map((t) => t.agent),
       targets: resolvedTargets,
       skills: args.skills,
+      addDirs: args.addDirs.map((d) => normalizeDirPath(d, cwd)).filter(Boolean),
       prompt: combinedPrompt,
       config,
       session,
@@ -192,6 +195,12 @@ export async function main(argv: string[]): Promise<void> {
     session.pinnedSkills = Array.from(merged);
   }
 
+  // If user launched interactive mode with --add-dir <dir>, allow them for this session
+  if (args.addDirs.length > 0) {
+    const normalizedDirs = args.addDirs.map((d) => normalizeDirPath(d, cwd)).filter(Boolean);
+    session.allowedDirs = Array.from(new Set([...(session.allowedDirs ?? []), ...normalizedDirs]));
+  }
+
   // Interactive mode: Plain REPL if --plain or non-TTY, else full Unified Chat TUI
   if (args.plain || !process.stdin.isTTY || !process.stdout.isTTY) {
     await runPlainRepl({
@@ -202,6 +211,7 @@ export async function main(argv: string[]): Promise<void> {
       modelOverride: args.model,
       agentModels: initialAgentModels,
       permissionMode: args.permissionMode,
+      addDirs: args.addDirs.map((d) => normalizeDirPath(d, cwd)).filter(Boolean),
       agentDiscussion: args.discuss,
       discussionRounds: args.discussionRounds,
     });
@@ -216,6 +226,7 @@ export async function main(argv: string[]): Promise<void> {
     modelOverride: args.model,
     agentModels: initialAgentModels,
     permissionMode: args.permissionMode,
+    addDirs: args.addDirs.map((d) => normalizeDirPath(d, cwd)).filter(Boolean),
     agentDiscussion: args.discuss,
     discussionRounds: args.discussionRounds,
   });

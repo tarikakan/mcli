@@ -116,6 +116,9 @@ export function loadConfig(): McliConfig {
         parsed.permissionMode === "full"
           ? parsed.permissionMode
           : defaults.permissionMode,
+      allowedDirs: Array.isArray(parsed.allowedDirs)
+        ? parsed.allowedDirs.filter((d): d is string => typeof d === "string" && d.trim().length > 0)
+        : undefined,
       memory: {
         agent:
           parsed.memory?.agent === "auto" ||

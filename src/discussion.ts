@@ -1,4 +1,6 @@
 import { getAdapter } from "./adapters/index.ts";
+import { detectPermissionRequest } from "./permissions.ts";
+import type { DetectedPermissionRequest } from "./permissions.ts";
 import { buildPromptWithContext, createMessageId } from "./session.ts";
 import { buildSkillsPromptBlock, prependSkillsToPrompt } from "./skills.ts";
 import type { SkillInfo } from "./skills.ts";
@@ -9,8 +11,11 @@ import type {
   AgentTarget,
   ChatMessage,
   McliConfig,
+  PermissionMode,
   StreamEvent,
 } from "./types.ts";
+
+export type PermissionApprovalDecision = "once" | "session" | "full" | "decline";
 
 export interface DiscussionParticipantOutput {
   target: AgentTarget;
@@ -28,6 +33,7 @@ export interface RunDiscussionOptions {
   summarizedUpTo?: number;
   transcriptPath?: string;
   skills?: SkillInfo[];
+  allowedDirs?: string[];
   cwd: string;
   config: McliConfig;
   rounds: number;
@@ -46,6 +52,7 @@ export interface RunDiscussionOptions {
     index: number;
     target: AgentTarget;
     roundLabel: string;
+    isRetry?: boolean;
   }) => void;
   onParticipantEvent?: (info: {
     index: number;
@@ -59,6 +66,13 @@ export interface RunDiscussionOptions {
     roundLabel: string;
     result: AgentRunResult;
   }) => void;
+  onPermissionRequest?: (info: {
+    index: number;
+    target: AgentTarget;
+    participantLabel: string;
+    roundLabel: string;
+    request: DetectedPermissionRequest;
+  }) => Promise<PermissionApprovalDecision>;
 }
 
 export interface DiscussionRunResult {
@@ -156,6 +170,13 @@ export async function runAgentDiscussion(
   const participantLabels = opts.targets.map((t) => formatTargetLabel(t));
   const activeSkills = opts.skills ?? [];
   const skillsPromptBlock = buildSkillsPromptBlock(activeSkills);
+  const sessionAllowedDirs: string[] = Array.from(
+    new Set([...(opts.config.allowedDirs ?? []), ...(opts.allowedDirs ?? [])]),
+  );
+  let sessionPerm: PermissionMode = opts.config.permissionMode;
+
+  const mergeDirs = (base: string[], extra: string[]): string[] =>
+    Array.from(new Set([...base, ...extra]));
 
   const runParticipant = async (
     target: AgentTarget,
@@ -163,11 +184,12 @@ export async function runAgentDiscussion(
     roundLabel: string,
     prompt: string,
     rawUserPrompt: string,
+    overrides?: { allowedDirs?: string[]; permissionMode?: PermissionMode; isRetry?: boolean },
   ): Promise<AgentRunResult> => {
     const adapter = getAdapter(target.agent);
     const agentConfig = opts.config.agents[target.agent] ?? {};
 
-    opts.onParticipantStart?.({ index, target, roundLabel });
+    opts.onParticipantStart?.({ index, target, roundLabel, isRetry: overrides?.isRetry });
 
     const res = await adapter.run({
       prompt: prependSkillsToPrompt(prompt, activeSkills),
@@ -179,7 +201,8 @@ export async function runAgentDiscussion(
       skillsPromptBlock,
       cwd: opts.cwd,
       model: target.model,
-      permissionMode: opts.config.permissionMode,
+      permissionMode: overrides?.permissionMode ?? sessionPerm,
+      allowedDirs: overrides?.allowedDirs ?? sessionAllowedDirs,
       config: agentConfig,
       signal: opts.signal,
       onEvent: (event) => {
@@ -190,7 +213,6 @@ export async function runAgentDiscussion(
     if (res.sessionId) {
       sessionIds[target.agent] = res.sessionId;
     }
-    if (res.error) hadError = true;
 
     opts.onParticipantDone?.({ index, target, roundLabel, result: res });
     return res;
@@ -216,8 +238,10 @@ export async function runAgentDiscussion(
     });
 
     const priorSnapshot = [...allEntries];
+    const roundInitialAllowedDirs = [...sessionAllowedDirs];
+    const roundInitialPerm = sessionPerm;
 
-    const runOne = async (target: AgentTarget, idx: number): Promise<DiscussionParticipantOutput> => {
+    const buildPromptsForTarget = (target: AgentTarget, idx: number) => {
       const baseWithCtx = buildPromptWithContext({
         userPrompt: opts.userPrompt,
         history: opts.history,
@@ -257,22 +281,106 @@ export async function runAgentDiscussion(
               priorEntries: priorSnapshot,
             }).trim();
 
-      const result = await runParticipant(target, idx, roundLabel, prompt, rawForApi);
-      return { target, label: selfLabel, round, roundLabel, result };
+      return { selfLabel, prompt, rawForApi };
     };
 
-    let roundOutputs: DiscussionParticipantOutput[];
+    const runOne = async (
+      target: AgentTarget,
+      idx: number,
+    ): Promise<{
+      entry: DiscussionParticipantOutput;
+      prompt: string;
+      rawForApi: string;
+    }> => {
+      const { selfLabel, prompt, rawForApi } = buildPromptsForTarget(target, idx);
+      const result = await runParticipant(target, idx, roundLabel, prompt, rawForApi);
+      return {
+        entry: { target, label: selfLabel, round, roundLabel, result },
+        prompt,
+        rawForApi,
+      };
+    };
+
+    let roundRuns: Array<{
+      entry: DiscussionParticipantOutput;
+      prompt: string;
+      rawForApi: string;
+    }>;
     if (parallel) {
-      roundOutputs = await Promise.all(opts.targets.map((t, idx) => runOne(t, idx)));
+      roundRuns = await Promise.all(opts.targets.map((t, idx) => runOne(t, idx)));
     } else {
-      roundOutputs = [];
+      roundRuns = [];
       for (let idx = 0; idx < opts.targets.length; idx++) {
         if (opts.signal.aborted) break;
-        roundOutputs.push(await runOne(opts.targets[idx], idx));
+        roundRuns.push(await runOne(opts.targets[idx], idx));
       }
     }
 
-    for (const entry of roundOutputs) {
+    // Mid-discussion permission approval: if any participant was blocked on an external dir or shell perm,
+    // pause BEFORE advancing to the next round, ask the user, and immediately retry that participant if approved.
+    if (opts.onPermissionRequest && !opts.signal.aborted) {
+      for (let idx = 0; idx < roundRuns.length; idx++) {
+        if (opts.signal.aborted) break;
+        const runItem = roundRuns[idx];
+        if (runItem.entry.result.aborted) continue;
+
+        const detected = detectPermissionRequest({
+          text: runItem.entry.result.text,
+          error: runItem.entry.result.error,
+          cwd: opts.cwd,
+          alreadyAllowedDirs: roundInitialAllowedDirs,
+          currentPerm: roundInitialPerm,
+        });
+        if (!detected) continue;
+
+        // If an earlier participant in this same round already got session-wide approval covering this exact request,
+        // retry automatically without prompting the user a second time.
+        const alreadySatisfiedBySession =
+          detected.requestedDirs.every((d) => sessionAllowedDirs.includes(d)) &&
+          (!detected.needsFullPerm || sessionPerm === "full");
+
+        let decision: PermissionApprovalDecision;
+        if (alreadySatisfiedBySession) {
+          decision = "session";
+        } else {
+          decision = await opts.onPermissionRequest({
+            index: idx,
+            target: runItem.entry.target,
+            participantLabel: runItem.entry.label,
+            roundLabel: runItem.entry.roundLabel,
+            request: detected,
+          });
+        }
+
+        if (opts.signal.aborted || decision === "decline") continue;
+
+        const retryDirs = mergeDirs(sessionAllowedDirs, detected.requestedDirs);
+        const retryPerm: PermissionMode =
+          decision === "full" || detected.needsFullPerm ? "full" : sessionPerm;
+
+        if (decision === "session" || decision === "full") {
+          for (const d of detected.requestedDirs) {
+            if (!sessionAllowedDirs.includes(d)) sessionAllowedDirs.push(d);
+          }
+          if (decision === "full" || detected.needsFullPerm) {
+            sessionPerm = "full";
+          }
+        }
+
+        const retryRes = await runParticipant(
+          runItem.entry.target,
+          idx,
+          runItem.entry.roundLabel,
+          runItem.prompt,
+          runItem.rawForApi,
+          { allowedDirs: retryDirs, permissionMode: retryPerm, isRetry: true },
+        );
+        runItem.entry = { ...runItem.entry, result: retryRes };
+      }
+    }
+
+    for (const { entry } of roundRuns) {
+      if (entry.result.error) hadError = true;
       allEntries.push(entry);
       const agentConfig = opts.config.agents[entry.target.agent] ?? {};
       messages.push({
@@ -333,7 +441,44 @@ export async function runAgentDiscussion(
       allEntries,
     }).trim();
 
-    const synthRes = await runParticipant(synthTarget, 0, roundLabel, synthPrompt, synthRaw);
+    let synthRes = await runParticipant(synthTarget, 0, roundLabel, synthPrompt, synthRaw);
+
+    if (opts.onPermissionRequest && !opts.signal.aborted && !synthRes.aborted) {
+      const detected = detectPermissionRequest({
+        text: synthRes.text,
+        error: synthRes.error,
+        cwd: opts.cwd,
+        alreadyAllowedDirs: sessionAllowedDirs,
+        currentPerm: sessionPerm,
+      });
+      if (detected) {
+        const decision = await opts.onPermissionRequest({
+          index: 0,
+          target: synthTarget,
+          participantLabel: formatTargetLabel(synthTarget),
+          roundLabel,
+          request: detected,
+        });
+        if (!opts.signal.aborted && decision !== "decline") {
+          const retryDirs = mergeDirs(sessionAllowedDirs, detected.requestedDirs);
+          const retryPerm: PermissionMode =
+            decision === "full" || detected.needsFullPerm ? "full" : sessionPerm;
+          if (decision === "session" || decision === "full") {
+            for (const d of detected.requestedDirs) {
+              if (!sessionAllowedDirs.includes(d)) sessionAllowedDirs.push(d);
+            }
+            if (decision === "full" || detected.needsFullPerm) sessionPerm = "full";
+          }
+          synthRes = await runParticipant(synthTarget, 0, roundLabel, synthPrompt, synthRaw, {
+            allowedDirs: retryDirs,
+            permissionMode: retryPerm,
+            isRetry: true,
+          });
+        }
+      }
+    }
+
+    if (synthRes.error) hadError = true;
     const agentConfig = opts.config.agents[synthTarget.agent] ?? {};
     messages.push({
       id: createMessageId(),

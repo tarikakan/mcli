@@ -103,6 +103,8 @@ export interface McliConfig {
   discussionRounds: number;
   /** Unified headless permission posture across Claude, Codex, Agy & Kimi */
   permissionMode: PermissionMode;
+  /** Extra external directories always passed via --add-dir to Claude, Codex & Agy */
+  allowedDirs?: string[];
   memory: MemoryConfig;
   /** Extra directories to scan for SKILL.md skills */
   skillDirs?: string[];
@@ -144,6 +146,8 @@ export interface SessionData {
   summarizedUpTo?: number;
   /** Skill names pinned for every turn in this session */
   pinnedSkills?: string[];
+  /** Extra directories granted access for this session (--add-dir) */
+  allowedDirs?: string[];
 }
 
 export interface StreamEvent {
@@ -173,6 +177,7 @@ export interface RunAgentOptions {
   cwd: string;
   model?: string;
   permissionMode?: PermissionMode;
+  allowedDirs?: string[];
   sessionId?: string;
   config: AgentConfig;
   signal: AbortSignal;

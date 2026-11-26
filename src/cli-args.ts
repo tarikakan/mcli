@@ -7,6 +7,7 @@ export interface ParsedCliArgs {
   agentModels: Partial<Record<AgentId, string>>;
   targets: AgentTarget[];
   skills: string[];
+  addDirs: string[];
   promptParts: string[];
   prompt: string;
   model?: string;
@@ -33,6 +34,7 @@ export interface ParsedInlineInput {
   agentModels: Partial<Record<AgentId, string>>;
   targets: AgentTarget[];
   skills: string[];
+  addDirs: string[];
   modelOverride?: string;
   permissionMode?: PermissionMode;
   discuss?: boolean;
@@ -61,6 +63,8 @@ const RESERVED_FLAGS = new Set<string>([
   "-m",
   "--skills",
   "--skill",
+  "--add-dir",
+  "--allow-dir",
   "--perm",
   "--permission",
   "--permissions",
@@ -232,6 +236,7 @@ function parseDollarSkillToken(token: string): string | undefined {
 export function parseCliArgs(argv: string[]): ParsedCliArgs {
   const rawTargets: AgentTarget[] = [];
   const skills: string[] = [];
+  const addDirs: string[] = [];
   const promptParts: string[] = [];
   const passthroughArgs: string[] = [];
   const unknownFlags: string[] = [];
@@ -331,6 +336,22 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       pendingModelTarget = undefined;
       continue;
     }
+    if (arg === "--add-dir" || arg === "--allow-dir") {
+      const next = argv[i + 1];
+      if (next !== undefined) {
+        if (!addDirs.includes(next)) addDirs.push(next);
+        i++;
+      }
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (arg.startsWith("--add-dir=") || arg.startsWith("--allow-dir=")) {
+      const val = arg.slice(arg.indexOf("=") + 1).trim();
+      if (val && !addDirs.includes(val)) addDirs.push(val);
+      pendingModelTarget = undefined;
+      continue;
+    }
+
     if (arg === "--read-only") {
       permissionMode = "read-only";
       pendingModelTarget = undefined;
@@ -477,6 +498,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     agentModels,
     targets,
     skills,
+    addDirs,
     promptParts,
     prompt: promptParts.join(" ").trim(),
     model,
@@ -548,6 +570,7 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
       agentModels: {},
       targets: [],
       skills: [],
+      addDirs: [],
       noSynthesis: false,
       listModels: false,
       listSkills: false,
@@ -566,6 +589,7 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
       agentModels: {},
       targets: [],
       skills: [],
+      addDirs: [],
       noSynthesis: false,
       listModels: false,
       listSkills: false,
@@ -580,6 +604,7 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
   const tokens = tokenizeInline(trimmed);
   const rawTargets: AgentTarget[] = [];
   const skills: string[] = [];
+  const addDirs: string[] = [];
   const promptTokens: string[] = [];
   let modelOverride: string | undefined;
   let permissionMode: PermissionMode | undefined;
@@ -613,6 +638,22 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
     }
 
     const nextText = tokens[i + 1] && !tokens[i + 1].quoted ? tokens[i + 1].text : undefined;
+
+    if (text === "--add-dir" || text === "--allow-dir") {
+      if (nextText) {
+        const cleanedDir = nextText.replace(/^["']|["']$/g, "");
+        if (cleanedDir && !addDirs.includes(cleanedDir)) addDirs.push(cleanedDir);
+        i++;
+      }
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (text.startsWith("--add-dir=") || text.startsWith("--allow-dir=")) {
+      const cleanedDir = text.slice(text.indexOf("=") + 1).replace(/^["']|["']$/g, "").trim();
+      if (cleanedDir && !addDirs.includes(cleanedDir)) addDirs.push(cleanedDir);
+      pendingModelTarget = undefined;
+      continue;
+    }
 
     if (text === "--read-only") {
       permissionMode = "read-only";
@@ -755,6 +796,7 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
     agentModels,
     targets,
     skills,
+    addDirs,
     modelOverride,
     permissionMode,
     discuss,

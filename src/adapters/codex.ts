@@ -1,4 +1,5 @@
 import { resolveBinary } from "../config.ts";
+import { filterExistingDirs } from "../permissions.ts";
 import type { AgentAdapter, AgentAvailability, AgentConfig, AgentRunResult, RunAgentOptions } from "../types.ts";
 import { expandArgTemplate, runCliProcess } from "./process.ts";
 
@@ -71,6 +72,11 @@ export const codexAdapter: AgentAdapter = {
           args.push("--sandbox", "workspace-write");
         } else if (opts.permissionMode === "full") {
           args.push("--dangerously-bypass-approvals-and-sandbox");
+        }
+      }
+      if (opts.allowedDirs?.length) {
+        for (const dir of filterExistingDirs(opts.allowedDirs, opts.cwd)) {
+          args.push("--add-dir", dir);
         }
       }
       if (extra.length) {
