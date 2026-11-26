@@ -1,6 +1,6 @@
 import { resolveModelAlias } from "./models.ts";
 import { AGENT_IDS, targetKey } from "./types.ts";
-import type { AgentId, AgentTarget } from "./types.ts";
+import type { AgentId, AgentTarget, PermissionMode } from "./types.ts";
 
 export interface ParsedCliArgs {
   agents: AgentId[];
@@ -11,6 +11,7 @@ export interface ParsedCliArgs {
   prompt: string;
   model?: string;
   session?: string;
+  permissionMode?: PermissionMode;
   discuss?: boolean;
   discussionRounds?: number;
   noSynthesis: boolean;
@@ -33,6 +34,7 @@ export interface ParsedInlineInput {
   targets: AgentTarget[];
   skills: string[];
   modelOverride?: string;
+  permissionMode?: PermissionMode;
   discuss?: boolean;
   discussionRounds?: number;
   noSynthesis: boolean;
@@ -59,6 +61,13 @@ const RESERVED_FLAGS = new Set<string>([
   "-m",
   "--skills",
   "--skill",
+  "--perm",
+  "--permission",
+  "--permissions",
+  "--read-only",
+  "--allow-edits",
+  "--yolo",
+  "--full-auto",
   "--session",
   "-s",
   "--new",
@@ -76,6 +85,15 @@ const RESERVED_FLAGS = new Set<string>([
   "--rounds",
   "--no-synthesis",
 ]);
+
+export function parsePermissionModeValue(raw: string | undefined): PermissionMode | undefined {
+  if (!raw) return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === "read-only" || v === "readonly" || v === "ro" || v === "plan") return "read-only";
+  if (v === "edit" || v === "edits" || v === "accept-edits" || v === "workspace-write") return "edit";
+  if (v === "full" || v === "auto" || v === "yolo" || v === "bypass" || v === "all") return "full";
+  return undefined;
+}
 
 export function isAgentId(value: string): value is AgentId {
   return AGENT_SET.has(value);
@@ -220,6 +238,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
 
   let model: string | undefined;
   let session: string | undefined;
+  let permissionMode: PermissionMode | undefined;
   let discuss: boolean | undefined;
   let discussionRounds: number | undefined;
   let noSynthesis = false;
@@ -312,6 +331,38 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       pendingModelTarget = undefined;
       continue;
     }
+    if (arg === "--read-only") {
+      permissionMode = "read-only";
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (arg === "--allow-edits") {
+      permissionMode = "edit";
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (arg === "--yolo" || arg === "--full-auto") {
+      permissionMode = "full";
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (arg === "--perm" || arg === "--permission" || arg === "--permissions") {
+      const parsedPerm = parsePermissionModeValue(argv[i + 1]);
+      if (parsedPerm) {
+        permissionMode = parsedPerm;
+        i++;
+      }
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (arg.startsWith("--perm=") || arg.startsWith("--permission=") || arg.startsWith("--permissions=")) {
+      const val = arg.slice(arg.indexOf("=") + 1);
+      const parsedPerm = parsePermissionModeValue(val);
+      if (parsedPerm) permissionMode = parsedPerm;
+      pendingModelTarget = undefined;
+      continue;
+    }
+
     if (arg === "--skills") {
       listSkills = true;
       pendingModelTarget = undefined;
@@ -430,6 +481,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     prompt: promptParts.join(" ").trim(),
     model,
     session,
+    permissionMode,
     discuss,
     discussionRounds,
     noSynthesis,
@@ -530,6 +582,7 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
   const skills: string[] = [];
   const promptTokens: string[] = [];
   let modelOverride: string | undefined;
+  let permissionMode: PermissionMode | undefined;
   let discuss: boolean | undefined;
   let discussionRounds: number | undefined;
   let noSynthesis = false;
@@ -560,6 +613,39 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
     }
 
     const nextText = tokens[i + 1] && !tokens[i + 1].quoted ? tokens[i + 1].text : undefined;
+
+    if (text === "--read-only") {
+      permissionMode = "read-only";
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (text === "--allow-edits") {
+      permissionMode = "edit";
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (text === "--yolo" || text === "--full-auto") {
+      permissionMode = "full";
+      pendingModelTarget = undefined;
+      continue;
+    }
+    if (text === "--perm" || text === "--permission" || text === "--permissions") {
+      const parsedPerm = parsePermissionModeValue(nextText);
+      if (parsedPerm) {
+        permissionMode = parsedPerm;
+        i++;
+        pendingModelTarget = undefined;
+        continue;
+      }
+    }
+    if (text.startsWith("--perm=") || text.startsWith("--permission=") || text.startsWith("--permissions=")) {
+      const parsedPerm = parsePermissionModeValue(text.slice(text.indexOf("=") + 1));
+      if (parsedPerm) {
+        permissionMode = parsedPerm;
+        pendingModelTarget = undefined;
+        continue;
+      }
+    }
 
     if (text === "--skill") {
       if (nextText) {
@@ -670,6 +756,7 @@ export function parseInlineInput(raw: string): ParsedInlineInput {
     targets,
     skills,
     modelOverride,
+    permissionMode,
     discuss,
     discussionRounds,
     noSynthesis,

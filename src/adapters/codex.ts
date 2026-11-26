@@ -54,8 +54,27 @@ export const codexAdapter: AgentAdapter = {
       if (model) {
         args.push("--model", model);
       }
-      if (opts.config.extraArgs?.length) {
-        args.push(...opts.config.extraArgs);
+      const extra = opts.config.extraArgs ?? [];
+      const hasPermFlag = extra.some(
+        (a) =>
+          a === "--sandbox" ||
+          a.startsWith("--sandbox=") ||
+          a === "-s" ||
+          a === "--full-auto" ||
+          a === "--yolo" ||
+          a === "--dangerously-bypass-approvals-and-sandbox",
+      );
+      if (!hasPermFlag && opts.permissionMode) {
+        if (opts.permissionMode === "read-only") {
+          args.push("--sandbox", "read-only");
+        } else if (opts.permissionMode === "edit") {
+          args.push("--sandbox", "workspace-write");
+        } else if (opts.permissionMode === "full") {
+          args.push("--dangerously-bypass-approvals-and-sandbox");
+        }
+      }
+      if (extra.length) {
+        args.push(...extra);
       }
       args.push(opts.prompt);
     }

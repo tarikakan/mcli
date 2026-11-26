@@ -179,6 +179,7 @@ export async function runAgentDiscussion(
       skillsPromptBlock,
       cwd: opts.cwd,
       model: target.model,
+      permissionMode: opts.config.permissionMode,
       config: agentConfig,
       signal: opts.signal,
       onEvent: (event) => {

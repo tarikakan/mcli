@@ -204,4 +204,92 @@ describe("adapters end-to-end", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("passes unified permissionMode flags to claude, codex, and agy adapters", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcli-perm-"));
+    try {
+      const echoArgs = `console.log(JSON.stringify({ type: "delta", text: process.argv.slice(2).join(" ") }));`;
+      const mockClaude = createMockBin(tmpDir, "claude", echoArgs);
+      const mockCodex = createMockBin(tmpDir, "codex", echoArgs);
+      const mockAgy = createMockBin(tmpDir, "agy", echoArgs);
+
+      const ctrl = new AbortController();
+
+      // edit mode (default): allows workspace writes/edits
+      const claudeEdit = await getAdapter("claude").run({
+        prompt: "hi",
+        rawUserPrompt: "hi",
+        history: [],
+        cwd: tmpDir,
+        permissionMode: "edit",
+        config: { command: mockClaude, outputMode: "stream-json" },
+        signal: ctrl.signal,
+        onEvent: () => {},
+      });
+      assert.match(claudeEdit.text, /--permission-mode acceptEdits/);
+
+      const codexEdit = await getAdapter("codex").run({
+        prompt: "hi",
+        rawUserPrompt: "hi",
+        history: [],
+        cwd: tmpDir,
+        permissionMode: "edit",
+        config: { command: mockCodex, outputMode: "stream-json" },
+        signal: ctrl.signal,
+        onEvent: () => {},
+      });
+      assert.match(codexEdit.text, /--sandbox workspace-write/);
+
+      const agyEdit = await getAdapter("agy").run({
+        prompt: "hi",
+        rawUserPrompt: "hi",
+        history: [],
+        cwd: tmpDir,
+        permissionMode: "edit",
+        config: { command: mockAgy, outputMode: "stream-json" },
+        signal: ctrl.signal,
+        onEvent: () => {},
+      });
+      assert.match(agyEdit.text, /--mode accept-edits/);
+
+      // full (--yolo) mode: allows writes + shell commands
+      const claudeFull = await getAdapter("claude").run({
+        prompt: "hi",
+        rawUserPrompt: "hi",
+        history: [],
+        cwd: tmpDir,
+        permissionMode: "full",
+        config: { command: mockClaude, outputMode: "stream-json" },
+        signal: ctrl.signal,
+        onEvent: () => {},
+      });
+      assert.match(claudeFull.text, /--permission-mode bypassPermissions/);
+
+      const codexFull = await getAdapter("codex").run({
+        prompt: "hi",
+        rawUserPrompt: "hi",
+        history: [],
+        cwd: tmpDir,
+        permissionMode: "full",
+        config: { command: mockCodex, outputMode: "stream-json" },
+        signal: ctrl.signal,
+        onEvent: () => {},
+      });
+      assert.match(codexFull.text, /--dangerously-bypass-approvals-and-sandbox/);
+
+      const agyFull = await getAdapter("agy").run({
+        prompt: "hi",
+        rawUserPrompt: "hi",
+        history: [],
+        cwd: tmpDir,
+        permissionMode: "full",
+        config: { command: mockAgy, outputMode: "stream-json" },
+        signal: ctrl.signal,
+        onEvent: () => {},
+      });
+      assert.match(agyFull.text, /--dangerously-skip-permissions/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

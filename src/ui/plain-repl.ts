@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { detectAllAgents, getAdapter } from "../adapters/index.ts";
-import { isAgentId, parseInlineInput } from "../cli-args.ts";
+import { isAgentId, parseInlineInput, parsePermissionModeValue } from "../cli-args.ts";
 import { getConfigPath, saveConfig } from "../config.ts";
 import { runAgentDiscussion } from "../discussion.ts";
 import {
@@ -30,7 +30,15 @@ import {
   resolveRequestedSkills,
 } from "../skills.ts";
 import { AGENT_IDS, AGENT_META, formatTargetLabel } from "../types.ts";
-import type { AgentId, AgentTarget, ChatMessage, McliConfig, SessionData, ToolEvent } from "../types.ts";
+import type {
+  AgentId,
+  AgentTarget,
+  ChatMessage,
+  McliConfig,
+  PermissionMode,
+  SessionData,
+  ToolEvent,
+} from "../types.ts";
 import {
   BOLD,
   DIM,
@@ -169,6 +177,7 @@ export interface OneShotOptions {
   cwd: string;
   modelOverride?: string;
   agentModels?: Partial<Record<AgentId, string>>;
+  permissionMode?: PermissionMode;
   discuss?: boolean;
   discussionRounds?: number;
   synthesize?: boolean;
@@ -213,6 +222,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   const effectiveConfig: McliConfig = {
     ...opts.config,
     ...effectiveLimits,
+    permissionMode: opts.permissionMode ?? opts.config.permissionMode,
   };
 
   const targets = normalizeTargets(opts);
@@ -362,6 +372,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
           skillsPromptBlock,
           cwd: opts.cwd,
           model: resolvedModel,
+          permissionMode: effectiveConfig.permissionMode,
           sessionId: opts.session.agentSessions[agent],
           config: agentConfig,
           signal: controller.signal,
@@ -446,6 +457,7 @@ export interface PlainReplOptions {
   initialAgent: AgentId;
   modelOverride?: string;
   agentModels?: Partial<Record<AgentId, string>>;
+  permissionMode?: PermissionMode;
   agentDiscussion?: boolean;
   discussionRounds?: number;
 }
@@ -453,6 +465,7 @@ export interface PlainReplOptions {
 export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
   let activeAgent: AgentId = opts.initialAgent;
   let shareContext = opts.config.shareContext;
+  let permissionMode: PermissionMode = opts.permissionMode ?? opts.config.permissionMode;
   let agentDiscussion = opts.agentDiscussion ?? opts.config.agentDiscussion;
   let discussionRounds = opts.discussionRounds ?? opts.config.discussionRounds;
   const modelOverrides: Partial<Record<AgentId, string>> = { ...opts.agentModels };
@@ -638,6 +651,23 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
         } else {
           shareContext = !shareContext;
           console.log(style(`Shared cross-agent context: ${shareContext ? "ON" : "OFF"}`, FG.cyan));
+        }
+      } else if (cmd === "perm" || cmd === "permission" || cmd === "permissions") {
+        const parsedPerm = parsePermissionModeValue(args);
+        if (!args) {
+          console.log(
+            style(
+              `Permission mode: ${permissionMode} (use /perm read-only | /perm edit | /perm full)`,
+              FG.cyan,
+            ),
+          );
+        } else if (parsedPerm) {
+          permissionMode = parsedPerm;
+          opts.config.permissionMode = parsedPerm;
+          saveConfig(opts.config);
+          console.log(style(`Permission mode set to "${permissionMode}" (saved to ~/.mcli/config.json).`, FG.green));
+        } else {
+          console.log(style("Usage: /perm [read-only | edit | full]", FG.yellow));
         }
       } else if (cmd === "discuss" || cmd === "discussion") {
         const parts = args.split(/\s+/).filter(Boolean);
@@ -856,9 +886,10 @@ export async function runPlainRepl(opts: PlainReplOptions): Promise<void> {
       targets,
       skills: parsed.skills,
       prompt: parsed.prompt,
-      config: { ...opts.config, shareContext, agentDiscussion, discussionRounds },
+      config: { ...opts.config, shareContext, permissionMode, agentDiscussion, discussionRounds },
       session: opts.session,
       cwd: opts.cwd,
+      permissionMode: parsed.permissionMode ?? permissionMode,
       discuss: useDiscuss,
       discussionRounds: parsed.discussionRounds ?? discussionRounds,
       synthesize: !parsed.noSynthesis,

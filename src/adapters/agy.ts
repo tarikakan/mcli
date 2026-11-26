@@ -52,8 +52,21 @@ export const agyAdapter: AgentAdapter = {
       if (model) {
         args.push("--model", model);
       }
-      if (opts.config.extraArgs?.length) {
-        args.push(...opts.config.extraArgs);
+      const extra = opts.config.extraArgs ?? [];
+      const hasPermFlag = extra.some(
+        (a) => a === "--mode" || a.startsWith("--mode=") || a === "--dangerously-skip-permissions",
+      );
+      if (!hasPermFlag && opts.permissionMode) {
+        if (opts.permissionMode === "read-only") {
+          args.push("--mode", "plan");
+        } else if (opts.permissionMode === "edit") {
+          args.push("--mode", "accept-edits");
+        } else if (opts.permissionMode === "full") {
+          args.push("--dangerously-skip-permissions");
+        }
+      }
+      if (extra.length) {
+        args.push(...extra);
       }
       args.push(opts.prompt);
     }

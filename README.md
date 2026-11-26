@@ -71,6 +71,7 @@ Inside the TUI:
 - `/status` — Show detection status of all 5 agents
 - `/clear` — Clear shared conversation history
 - `/history` — Summarize turns in the current session
+- `/perm [read-only|edit|full]` — Control headless tool permissions (`edit` allows file writes by default; `full` / `--yolo` also allows shell commands like `cp`, `pdflatex`, `npm test`)
 - `/skills` or `--skills` — List all `SKILL.md` skills across Claude, Codex, Agy, Kimi & workspace
 - `/skill [use <name>|off <name>|clear|show <name>]` — Pin/unpin or inspect skills across all agents
 - `/memory [status|set <agent[:model]|auto|local>|mode lean|balanced|full|auto on|off]` — Assign a cheap/fast Scribe agent to manage memory & save tokens

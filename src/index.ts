@@ -45,6 +45,8 @@ function printHelp(): void {
     "  --models               List available & preset models for all (or selected) agents",
     "  --skills               List all SKILL.md skills across Claude, Codex, Agy, Kimi & workspace",
     "  --skill <name>         Apply any CLI's skill to any agent (repeatable; or inline $<name>)",
+    "  --perm <mode>          Headless permissions: read-only | edit (default) | full (--yolo)",
+    "  --yolo, --full-auto    Shorthand for --perm full (auto-approve edits + shell commands)",
     "  --discuss, --agent discussion  Enable multi-round peer discussion + synthesis across 2+ agents",
     "  --rounds <N>           Number of discussion rounds (default: 2, max: 6)",
     "  --no-synthesis         Skip final consensus synthesis step after discussion rounds",
@@ -173,6 +175,7 @@ export async function main(argv: string[]): Promise<void> {
       cwd,
       modelOverride: args.model,
       agentModels: initialAgentModels,
+      permissionMode: args.permissionMode,
       discuss: args.discuss,
       discussionRounds: args.discussionRounds,
       synthesize: !args.noSynthesis,
@@ -198,6 +201,7 @@ export async function main(argv: string[]): Promise<void> {
       initialAgent,
       modelOverride: args.model,
       agentModels: initialAgentModels,
+      permissionMode: args.permissionMode,
       agentDiscussion: args.discuss,
       discussionRounds: args.discussionRounds,
     });
@@ -211,6 +215,7 @@ export async function main(argv: string[]): Promise<void> {
     initialAgent,
     modelOverride: args.model,
     agentModels: initialAgentModels,
+    permissionMode: args.permissionMode,
     agentDiscussion: args.discuss,
     discussionRounds: args.discussionRounds,
   });

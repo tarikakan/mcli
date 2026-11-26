@@ -52,8 +52,21 @@ export const claudeAdapter: AgentAdapter = {
       if (model) {
         args.push("--model", model);
       }
-      if (opts.config.extraArgs?.length) {
-        args.push(...opts.config.extraArgs);
+      const extra = opts.config.extraArgs ?? [];
+      const hasPermFlag = extra.some(
+        (a) => a === "--permission-mode" || a.startsWith("--permission-mode=") || a === "--dangerously-skip-permissions",
+      );
+      if (!hasPermFlag && opts.permissionMode) {
+        if (opts.permissionMode === "read-only") {
+          args.push("--permission-mode", "plan");
+        } else if (opts.permissionMode === "edit") {
+          args.push("--permission-mode", "acceptEdits");
+        } else if (opts.permissionMode === "full") {
+          args.push("--permission-mode", "bypassPermissions");
+        }
+      }
+      if (extra.length) {
+        args.push(...extra);
       }
     }
 

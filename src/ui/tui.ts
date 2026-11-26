@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { detectAllAgents, getAdapter } from "../adapters/index.ts";
-import { isAgentId, parseInlineInput } from "../cli-args.ts";
+import { isAgentId, parseInlineInput, parsePermissionModeValue } from "../cli-args.ts";
 import { getConfigPath, saveConfig } from "../config.ts";
 import { runAgentDiscussion } from "../discussion.ts";
 import {
@@ -42,6 +42,7 @@ import type {
   AgentTarget,
   ChatMessage,
   McliConfig,
+  PermissionMode,
   SessionData,
   ToolEvent,
 } from "../types.ts";
@@ -77,6 +78,7 @@ const SLASH_COMMANDS = [
   "/help",
   "/status",
   "/agents",
+  "/perm",
   "/skills",
   "/skill",
   "/clear",
@@ -177,6 +179,7 @@ export interface TuiOptions {
   initialAgent: AgentId;
   modelOverride?: string;
   agentModels?: Partial<Record<AgentId, string>>;
+  permissionMode?: PermissionMode;
   agentDiscussion?: boolean;
   discussionRounds?: number;
 }
@@ -195,6 +198,7 @@ export class UnifiedChatTui {
   private availability: Record<AgentId, AgentAvailability>;
   private modelOverrides: Partial<Record<AgentId, string>> = {};
   private shareContext: boolean;
+  private permissionMode: PermissionMode;
   private agentDiscussion: boolean;
   private discussionRounds: number;
 
@@ -251,6 +255,7 @@ export class UnifiedChatTui {
     this.cwd = opts.cwd;
     this.activeAgent = opts.initialAgent;
     this.shareContext = opts.config.shareContext;
+    this.permissionMode = opts.permissionMode ?? opts.config.permissionMode;
     this.agentDiscussion = opts.agentDiscussion ?? opts.config.agentDiscussion;
     this.discussionRounds = opts.discussionRounds ?? opts.config.discussionRounds;
     this.availability = detectAllAgents(opts.config);
@@ -620,7 +625,7 @@ export class UnifiedChatTui {
       const partial = prefix.slice(lead.length).toLowerCase();
       const candidates =
         lead === "--"
-          ? [...AGENT_IDS, "models", "model", "skills", "skill", "discuss", "agent-discussion", "rounds"]
+          ? [...AGENT_IDS, "models", "model", "skills", "skill", "perm", "yolo", "read-only", "discuss", "agent-discussion", "rounds"]
           : [...AGENT_IDS];
       const matched = candidates.find((id) => id.startsWith(partial) && id !== partial);
       if (matched) {
@@ -1284,6 +1289,7 @@ export class UnifiedChatTui {
       rounds,
       synthesize: !parsed.noSynthesis,
       skills: parsed.skills,
+      permissionMode: parsed.permissionMode ?? this.permissionMode,
     });
   }
 
@@ -1317,6 +1323,7 @@ export class UnifiedChatTui {
             "- `Ctrl+C` / `Esc`: cancel active streaming response without quitting",
             "",
             "**Slash Commands:**",
+            "- `/perm [read-only|edit|full]` — control headless tool permissions across all CLIs (`edit` allows file writes; `full`/`--yolo` also allows shell commands like `cp`, `pdflatex`, `npm test`)",
             "- `/skills` or `--skills` — list all skills from Claude, Codex, Agy, Kimi & workspace",
             "- `/skill [use <name>|off <name>|clear|show <name>]` — pin/unpin or inspect skills across all agents (or use `--skill <name>` / `$<name>` per turn)",
             "- `/discuss [on|off|rounds <N>]` — toggle default multi-agent discussion mode",
@@ -1336,6 +1343,38 @@ export class UnifiedChatTui {
           ].join("\n"),
         );
         return;
+
+      case "perm":
+      case "permission":
+      case "permissions": {
+        const parsedPerm = parsePermissionModeValue(args);
+        if (!args.trim()) {
+          this.addSystemMessage(
+            [
+              `**Headless Tool Permissions:** \`${this.permissionMode}\``,
+              "",
+              "- `read-only` — Read/analyze only (`claude: plan`, `codex: read-only`, `agy: plan`)",
+              "- `edit` *(default)* — Auto-approve workspace file writes & edits (`claude: acceptEdits`, `codex: workspace-write`, `agy: accept-edits`)",
+              "- `full` *(alias: `yolo` / `--yolo`)* — Auto-approve file writes **and** shell commands (`cp`, `pdflatex`, `npm test`, etc.) (`claude: bypassPermissions`, `codex: --dangerously-bypass-approvals-and-sandbox`, `agy: --dangerously-skip-permissions`)",
+              "",
+              "Switch with `/perm read-only`, `/perm edit`, or `/perm full` (saves to `~/.mcli/config.json`), or add `--yolo` on any single prompt.",
+            ].join("\n"),
+          );
+          return;
+        }
+        if (parsedPerm) {
+          this.permissionMode = parsedPerm;
+          this.config.permissionMode = parsedPerm;
+          saveConfig(this.config);
+          this.setNotice(
+            `Permission mode set to "${parsedPerm}" across all CLIs (saved to ~/.mcli/config.json).`,
+            3500,
+          );
+          return;
+        }
+        this.setNotice("Usage: /perm [read-only | edit | full]");
+        return;
+      }
 
       case "skills":
         this.showSkillsInChat();
@@ -1811,7 +1850,13 @@ export class UnifiedChatTui {
   private async dispatchTargets(
     targets: AgentTarget[],
     userPrompt: string,
-    discussionOpts: { discuss: boolean; rounds: number; synthesize: boolean; skills?: string[] },
+    discussionOpts: {
+      discuss: boolean;
+      rounds: number;
+      synthesize: boolean;
+      skills?: string[];
+      permissionMode?: PermissionMode;
+    },
   ): Promise<void> {
     const historySnapshot = [...this.session.messages];
     const transcriptPath = getSessionTranscriptPath(this.session.id);
@@ -1863,9 +1908,11 @@ export class UnifiedChatTui {
     }, 90);
 
     const effectiveLimits = getEffectiveContextConfig(this.config, this.shareContext);
+    const activePerm = discussionOpts.permissionMode ?? this.permissionMode;
     const effectiveConfig: McliConfig = {
       ...this.config,
       ...effectiveLimits,
+      permissionMode: activePerm,
       agentDiscussion: this.agentDiscussion,
       discussionRounds: discussionOpts.rounds,
     };
@@ -1953,6 +2000,18 @@ export class UnifiedChatTui {
           this.session.messages.push(...discResult.messages);
         }
         saveSession(this.session);
+
+        if (
+          activePerm !== "full" &&
+          discResult.messages.some((m) =>
+            /permission wasn't granted|was blocked|not permitted|requires? approval/i.test(m.content),
+          )
+        ) {
+          this.setNotice(
+            `Hint: A tool/shell call was blocked under perm="${activePerm}". Run /perm full (or add --yolo) to allow shell commands too.`,
+            6000,
+          );
+        }
       } else {
         this.liveStreams = targets.map((t) => ({
           agent: t.agent,
@@ -1994,6 +2053,7 @@ export class UnifiedChatTui {
               skillsPromptBlock,
               cwd: this.cwd,
               model: target.model,
+              permissionMode: activePerm,
               sessionId: this.session.agentSessions[target.agent],
               config: agentConfig,
               signal: controller.signal,
@@ -2039,6 +2099,17 @@ export class UnifiedChatTui {
         }
 
         saveSession(this.session);
+
+        // If an agent mentioned blocked permissions while not in full mode, surface an actionable hint
+        if (
+          activePerm !== "full" &&
+          results.some(({ res }) => /permission wasn't granted|was blocked|not permitted|requires? approval/i.test(res.text))
+        ) {
+          this.setNotice(
+            `Hint: A tool/shell call was blocked under perm="${activePerm}". Run /perm full (or add --yolo) to allow shell commands too.`,
+            6000,
+          );
+        }
       }
     } finally {
       if (this.spinnerTimer) {
@@ -2101,13 +2172,14 @@ export class UnifiedChatTui {
     const msgCount = this.session.messages.filter((m) => m.role !== "system").length;
     const activeModel = this.modelOverrides[this.activeAgent] ?? this.config.agents[this.activeAgent]?.model;
     const modelPart = activeModel ? `  •  model: ${activeModel}` : "  •  model: default";
+    const permPart = `  •  perm: ${this.permissionMode}`;
     const discPart = this.agentDiscussion ? `  •  discuss: on (${this.discussionRounds}r)` : "";
     const pinnedSkills = this.session.pinnedSkills ?? [];
     const skillPart = pinnedSkills.length > 0 ? `  •  skills: ${pinnedSkills.join(",")}` : "";
     const ctxPart = `context: ${this.shareContext ? "on" : "off"} (${msgCount} msgs)`;
     const row2 = truncateVisible(
       style(
-        ` dir: ${dirName}  •  session: ${this.session.name}  •  ${ctxPart}${modelPart}${discPart}${skillPart}  •  Ctrl+O: models  •  /help`,
+        ` dir: ${dirName}  •  session: ${this.session.name}  •  ${ctxPart}${modelPart}${permPart}${discPart}${skillPart}  •  /help`,
         DIM,
       ),
       cols,
@@ -2339,7 +2411,7 @@ export class UnifiedChatTui {
     }
 
     let out = raw.replace(
-      /(^|\s)(--agent\s+discussion|--agent-discussion|--discuss(?:ion)?|--no-discuss(?:ion)?|--debate|--models|--skills|--skill(?:=\S+|\s+\S+)?|--no-synthesis|--rounds(?:=\d+|\s+\d+)?)(?=\s|$)/gi,
+      /(^|\s)(--agent\s+discussion|--agent-discussion|--discuss(?:ion)?|--no-discuss(?:ion)?|--debate|--models|--skills|--skill(?:=\S+|\s+\S+)?|--perm(?:issions?)?(?:=\S+|\s+\S+)?|--yolo|--full-auto|--read-only|--allow-edits|--no-synthesis|--rounds(?:=\d+|\s+\d+)?)(?=\s|$)/gi,
       (_m, lead: string, flag: string) => `${lead}${style(flag, FG.brightCyan, BOLD)}`,
     );
 

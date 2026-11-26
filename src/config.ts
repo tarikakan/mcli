@@ -24,6 +24,7 @@ export function createDefaultConfig(): McliConfig {
     maxContextChars: 24000,
     agentDiscussion: false,
     discussionRounds: 2,
+    permissionMode: "edit",
     memory: {
       agent: "auto",
       autoCompact: true,
@@ -109,6 +110,12 @@ export function loadConfig(): McliConfig {
         typeof parsed.discussionRounds === "number" && parsed.discussionRounds >= 1
           ? Math.min(6, Math.floor(parsed.discussionRounds))
           : defaults.discussionRounds,
+      permissionMode:
+        parsed.permissionMode === "read-only" ||
+        parsed.permissionMode === "edit" ||
+        parsed.permissionMode === "full"
+          ? parsed.permissionMode
+          : defaults.permissionMode,
       memory: {
         agent:
           parsed.memory?.agent === "auto" ||

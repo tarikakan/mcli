@@ -77,6 +77,8 @@ export interface AgentConfig {
   baseUrl?: string;
 }
 
+export type PermissionMode = "read-only" | "edit" | "full";
+
 export type MemoryMode = "lean" | "balanced" | "full";
 
 export interface MemoryConfig {
@@ -99,6 +101,8 @@ export interface McliConfig {
   maxContextChars: number;
   agentDiscussion: boolean;
   discussionRounds: number;
+  /** Unified headless permission posture across Claude, Codex, Agy & Kimi */
+  permissionMode: PermissionMode;
   memory: MemoryConfig;
   /** Extra directories to scan for SKILL.md skills */
   skillDirs?: string[];
@@ -168,6 +172,7 @@ export interface RunAgentOptions {
   skillsPromptBlock?: string;
   cwd: string;
   model?: string;
+  permissionMode?: PermissionMode;
   sessionId?: string;
   config: AgentConfig;
   signal: AbortSignal;
