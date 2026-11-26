@@ -2,6 +2,8 @@
 
 **Unified Multi-Agent Chat TUI & CLI** combining **Claude**, **Codex**, **Agy**, **DeepSeek**, and **Kimi** in a single terminal window with **shared conversation history** and simple `--agent` flags.
 
+> **Docs (PDF):** [Full User Manual (`mcli-manual.pdf`)](./mcli-manual.pdf) · [2-Page Quick Cheat Sheet (`mcli-cheatsheet.pdf`)](./mcli-cheatsheet.pdf)
+
 ## Features
 
 - **All 5 agents in one window** via simple flags: `--claude`, `--codex`, `--agy`, `--deepseek`, `--kimi`
