@@ -77,7 +77,7 @@ export async function runCliProcess(opts: SpawnCliOptions): Promise<AgentRunResu
       child = spawn(opts.binary, opts.args, {
         cwd: opts.cwd,
         env: buildEnrichedEnv(opts.env),
-        stdio: ["pipe", "pipe", "pipe"],
+        stdio: [opts.stdinText !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -118,10 +118,10 @@ export async function runCliProcess(opts: SpawnCliOptions): Promise<AgentRunResu
       opts.signal.addEventListener("abort", handleAbort, { once: true });
     }
 
-    if (opts.stdinText !== undefined) {
+    if (opts.stdinText !== undefined && child.stdin) {
       child.stdin.write(opts.stdinText);
+      child.stdin.end();
     }
-    child.stdin.end();
 
     const processLine = (line: string): void => {
       if (opts.outputMode === "text") {

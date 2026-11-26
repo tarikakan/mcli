@@ -48,7 +48,7 @@ describe("adapters end-to-end", () => {
 
       const cases = [
         { id: "claude" as const, bin: mockClaude, expect: "Claude says hi" },
-        { id: "codex" as const, bin: mockCodex, expect: "Codex args: exec --json hello" },
+        { id: "codex" as const, bin: mockCodex, expect: "Codex args: exec --skip-git-repo-check --json hello" },
         { id: "agy" as const, bin: mockAgy, expect: "Agy ready" },
         { id: "kimi" as const, bin: mockKimi, expect: "Kimi reply" },
       ];

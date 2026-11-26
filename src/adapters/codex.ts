@@ -44,6 +44,10 @@ export const codexAdapter: AgentAdapter = {
       args = expandArgTemplate(opts.config.args, opts.prompt);
     } else {
       args = ["exec"];
+      const hasSkipCheck = opts.config.extraArgs?.includes("--skip-git-repo-check");
+      if (!hasSkipCheck) {
+        args.push("--skip-git-repo-check");
+      }
       if (outputMode === "stream-json") {
         args.push("--json");
       }
